@@ -145,6 +145,8 @@ struct mountpoint_params {
     uint64_t write_bytes_rate = std::numeric_limits<uint64_t>::max();
     uint64_t read_req_rate = std::numeric_limits<uint64_t>::max();
     uint64_t write_req_rate = std::numeric_limits<uint64_t>::max();
+    uint64_t read_saturation_length = std::numeric_limits<uint64_t>::max();
+    uint64_t write_saturation_length = std::numeric_limits<uint64_t>::max();
 };
 
 }
@@ -159,6 +161,12 @@ struct convert<seastar::mountpoint_params> {
         mp.read_req_rate = parse_memory_size(node["read_iops"].as<std::string>());
         mp.write_bytes_rate = parse_memory_size(node["write_bandwidth"].as<std::string>());
         mp.write_req_rate = parse_memory_size(node["write_iops"].as<std::string>());
+        if (node["read_saturation_length"]) {
+            mp.read_saturation_length = parse_memory_size(node["read_saturation_length"].as<std::string>());
+        }
+        if (node["write_saturation_length"]) {
+            mp.write_saturation_length = parse_memory_size(node["write_saturation_length"].as<std::string>());
+        }
         return true;
     }
 };
@@ -476,6 +484,10 @@ future<size_t> pollable_fd_state::sendto(socket_address addr, const void* buf, s
 
 namespace internal {
 
+void set_need_preempt_var(const preemption_monitor* np) {
+    get_need_preempt_var() = np;
+}
+
 #ifdef SEASTAR_TASK_HISTOGRAM
 
 class task_histogram {
@@ -529,8 +541,9 @@ constexpr std::chrono::milliseconds lowres_clock_impl::_granularity;
 constexpr unsigned reactor::max_queues;
 constexpr unsigned reactor::max_aio_per_queue;
 
-// Broken (returns spurious EIO). Cause/fix unknown.
-bool aio_nowait_supported = false;
+// Base version where this works; some filesystems were only fixed later, so
+// this value is mixed in with filesystem-provided values later.
+bool aio_nowait_supported = kernel_uname().whitelisted({"4.13"});
 
 static bool sched_debug() {
     return false;
@@ -691,6 +704,23 @@ void reactor::handle_signal(int signo, noncopyable_function<void ()>&& handler) 
     _signals.handle_signal(signo, std::move(handler));
 }
 
+// Fills a buffer with a hexadecimal representation of an integer
+// and returns a pointer to the first character.
+// For example, convert_hex_safe(buf, 4, uint16_t(12)) fills the buffer with "   c".
+template<typename Integral>
+SEASTAR_CONCEPT( requires std::is_integral_v<Integral> )
+char* convert_hex_safe(char *buf, size_t bufsz, Integral n) noexcept {
+    const char *digits = "0123456789abcdef";
+    memset(buf, ' ', bufsz);
+    auto* p = buf + bufsz;
+    do {
+        assert(p > buf);
+        *--p = digits[n & 0xf];
+        n >>= 4;
+    } while (n);
+    return p;
+}
+
 // Accumulates an in-memory backtrace and flush to stderr eventually.
 // Async-signal safe.
 class backtrace_buffer {
@@ -703,10 +733,15 @@ public:
         _pos = 0;
     }
 
-    void append(const char* str, size_t len) noexcept {
+    void reserve(size_t len) noexcept {
+        assert(len < _max_size);
         if (_pos + len >= _max_size) {
             flush();
         }
+    }
+
+    void append(const char* str, size_t len) noexcept {
+        reserve(len);
         memcpy(_buf + _pos, str, len);
         _pos += len;
     }
@@ -723,8 +758,8 @@ public:
     template <typename Integral>
     void append_hex(Integral ptr) noexcept {
         char buf[sizeof(ptr) * 2];
-        convert_zero_padded_hex_safe(buf, sizeof(buf), ptr);
-        append(buf, sizeof(buf));
+        auto p = convert_hex_safe(buf, sizeof(buf), ptr);
+        append(p, (buf + sizeof(buf)) - p);
     }
 
     void append_backtrace() noexcept {
@@ -740,23 +775,37 @@ public:
             append("\n");
         });
     }
+
+    void append_backtrace_oneline() noexcept {
+        backtrace([this] (frame f) noexcept {
+            reserve(3 + sizeof(f.addr) * 2);
+            append(" 0x");
+            append_hex(f.addr);
+        });
+    }
 };
 
-static void print_with_backtrace(backtrace_buffer& buf) noexcept {
+static void print_with_backtrace(backtrace_buffer& buf, bool oneline) noexcept {
     if (local_engine) {
         buf.append(" on shard ");
         buf.append_decimal(this_shard_id());
     }
 
+  if (!oneline) {
     buf.append(".\nBacktrace:\n");
     buf.append_backtrace();
+  } else {
+    buf.append(". Backtrace:");
+    buf.append_backtrace_oneline();
+    buf.append("\n");
+  }
     buf.flush();
 }
 
-static void print_with_backtrace(const char* cause) noexcept {
+static void print_with_backtrace(const char* cause, bool oneline = false) noexcept {
     backtrace_buffer buf;
     buf.append(cause);
-    print_with_backtrace(buf);
+    print_with_backtrace(buf, oneline);
 }
 
 // Installs signal handler stack for current thread.
@@ -894,12 +943,12 @@ reactor::reactor(unsigned id, reactor_backend_selector rbs, reactor_config cfg)
      * the chosen backend constructor may want to handle signals and thus
      * needs the _signals._signal_handlers map to be initialized.
      */
-    _backend = rbs.create(this);
+    _backend = rbs.create(*this);
     *internal::get_scheduling_group_specific_thread_local_data_ptr() = &_scheduling_group_specific_data;
     _task_queues.push_back(std::make_unique<task_queue>(0, "main", 1000));
     _task_queues.push_back(std::make_unique<task_queue>(1, "atexit", 1000));
     _at_destroy_tasks = _task_queues.back().get();
-    g_need_preempt = &_preemption_monitor;
+    set_need_preempt_var(&_preemption_monitor);
     seastar::thread_impl::init();
     _backend->start_tick();
 
@@ -955,6 +1004,13 @@ reactor::~reactor() {
             }
         }
     }
+}
+
+reactor::sched_stats
+reactor::get_sched_stats() const {
+    sched_stats ret;
+    ret.tasks_processed = tasks_processed();
+    return ret;
 }
 
 future<> reactor::readable(pollable_fd_state& fd) {
@@ -1126,41 +1182,6 @@ void cpu_stall_detector::end_sleep() {
 }
 
 void
-reactor::task_quota_timer_thread_fn() {
-    auto thread_name = seastar::format("timer-{}", _id);
-    pthread_setname_np(pthread_self(), thread_name.c_str());
-
-    sigset_t mask;
-    sigfillset(&mask);
-    for (auto sig : { SIGSEGV }) {
-        sigdelset(&mask, sig);
-    }
-    auto r = ::pthread_sigmask(SIG_BLOCK, &mask, NULL);
-    if (r) {
-        seastar_logger.error("Thread {}: failed to block signals. Aborting.", thread_name.c_str());
-        abort();
-    }
-
-    // We need to wait until task quota is set before we can calculate how many ticks are to
-    // a minute. Technically task_quota is used from many threads, but since it is read-only here
-    // and only used during initialization we will avoid complicating the code.
-    {
-        uint64_t events;
-        _task_quota_timer.read(&events, 8);
-        request_preemption();
-    }
-
-    while (!_dying.load(std::memory_order_relaxed)) {
-        uint64_t events;
-        _task_quota_timer.read(&events, 8);
-        request_preemption();
-
-        // We're in a different thread, but guaranteed to be on the same core, so even
-        // a signal fence is overdoing it
-        std::atomic_signal_fence(std::memory_order_seq_cst);
-    }
-}
-void
 reactor::update_blocked_reactor_notify_ms(std::chrono::milliseconds ms) {
     auto cfg = _cpu_stall_detector->get_config();
     if (ms != cfg.threshold) {
@@ -1207,7 +1228,7 @@ cpu_stall_detector::generate_trace() {
     buf.append("Reactor stalled for ");
     buf.append_decimal(uint64_t(delta / 1ms));
     buf.append(" ms");
-    print_with_backtrace(buf);
+    print_with_backtrace(buf, _config.oneline);
 }
 
 template <typename T, typename E, typename EnableFunc>
@@ -1316,6 +1337,7 @@ void reactor::configure(boost::program_options::variables_map vm) {
     cpu_stall_detector_config csdc;
     csdc.threshold = blocked_time;
     csdc.stall_detector_reports_per_minute = vm["blocked-reactor-reports-per-minute"].as<unsigned>();
+    csdc.oneline = vm["blocked-reactor-report-format-oneline"].as<bool>();
     _cpu_stall_detector->update_config(csdc);
 
     _max_task_backlog = vm["max-task-backlog"].as<unsigned>();
@@ -1334,6 +1356,7 @@ void reactor::configure(boost::program_options::variables_map vm) {
         _aio_eventfd = pollable_fd(file_desc::eventfd(0, 0));
     }
     set_bypass_fsync(vm["unsafe-bypass-fsync"].as<bool>());
+    _kernel_page_cache = vm["kernel-page-cache"].as<bool>();
     _force_io_getevents_syscall = vm["force-aio-syscalls"].as<bool>();
     aio_nowait_supported = vm["linux-aio-nowait"].as<bool>();
     _have_aio_fsync = vm["aio-fsync"].as<bool>();
@@ -1516,16 +1539,6 @@ void io_completion::complete_with(ssize_t res) {
     }
 }
 
-void
-reactor::submit_io(io_completion* desc, io_request req) noexcept {
-    req.attach_kernel_completion(desc);
-    try {
-        _pending_io.push_back(std::move(req));
-    } catch (...) {
-        desc->set_exception(std::current_exception());
-    }
-}
-
 bool
 reactor::flush_pending_aio() {
     for (auto& ioq : _io_queues) {
@@ -1560,17 +1573,17 @@ const io_priority_class& default_priority_class() {
 }
 
 future<size_t>
-reactor::submit_io_read(io_queue* ioq, const io_priority_class& pc, size_t len, io_request req) noexcept {
+reactor::submit_io_read(io_queue* ioq, const io_priority_class& pc, size_t len, io_request req, io_intent* intent) noexcept {
     ++_io_stats.aio_reads;
     _io_stats.aio_read_bytes += len;
-    return ioq->queue_request(pc, len, std::move(req));
+    return ioq->queue_request(pc, len, std::move(req), intent);
 }
 
 future<size_t>
-reactor::submit_io_write(io_queue* ioq, const io_priority_class& pc, size_t len, io_request req) noexcept {
+reactor::submit_io_write(io_queue* ioq, const io_priority_class& pc, size_t len, io_request req, io_intent* intent) noexcept {
     ++_io_stats.aio_writes;
     _io_stats.aio_write_bytes += len;
-    return ioq->queue_request(pc, len, std::move(req));
+    return ioq->queue_request(pc, len, std::move(req), intent);
 }
 
 namespace internal {
@@ -1598,10 +1611,11 @@ future<file>
 reactor::open_file_dma(std::string_view nameref, open_flags flags, file_open_options options) noexcept {
     return do_with(static_cast<int>(flags), std::move(options), [this, nameref] (auto& open_flags, file_open_options& options) {
         sstring name(nameref);
-        return _thread_pool->submit<syscall_result<int>>([name, &open_flags, &options, strict_o_direct = _strict_o_direct, bypass_fsync = _bypass_fsync] () mutable {
-            // We want O_DIRECT, except in two cases:
+        return _thread_pool->submit<syscall_result<int>>([this, name, &open_flags, &options, strict_o_direct = _strict_o_direct, bypass_fsync = _bypass_fsync] () mutable {
+            // We want O_DIRECT, except in three cases:
             //   - tmpfs (which doesn't support it, but works fine anyway)
             //   - strict_o_direct == false (where we forgive it being not supported)
+            //   - _kernel_page_cache == true (where we disable it for short-lived test processes)
             // Because open() with O_DIRECT will fail, we open it without O_DIRECT, try
             // to update it to O_DIRECT with fcntl(), and if that fails, see if we
             // can forgive it.
@@ -1622,7 +1636,8 @@ reactor::open_file_dma(std::string_view nameref, open_flags flags, file_open_opt
             if (fd == -1) {
                 return wrap_syscall<int>(fd);
             }
-            int r = ::fcntl(fd, F_SETFL, open_flags | O_DIRECT);
+            int o_direct_flag = _kernel_page_cache ? 0 : O_DIRECT;
+            int r = ::fcntl(fd, F_SETFL, open_flags | o_direct_flag);
             auto maybe_ret = wrap_syscall<int>(r);  // capture errno (should be EINVAL)
             if (r == -1  && strict_o_direct && !is_tmpfs(fd)) {
                 ::close(fd);
@@ -1632,7 +1647,8 @@ reactor::open_file_dma(std::string_view nameref, open_flags flags, file_open_opt
                 fsxattr attr = {};
                 if (options.extent_allocation_size_hint) {
                     attr.fsx_xflags |= XFS_XFLAG_EXTSIZE;
-                    attr.fsx_extsize = options.extent_allocation_size_hint;
+                    attr.fsx_extsize = std::min(options.extent_allocation_size_hint,
+                                        file_open_options::max_extent_allocation_size_hint);
                 }
                 // Ignore error; may be !xfs, and just a hint anyway
                 ::ioctl(fd, XFS_IOC_FSSETXATTR, &attr);
@@ -1983,7 +1999,7 @@ reactor::fdatasync(int fd) noexcept {
             auto desc = new fsync_io_desc;
             auto fut = desc->get_future();
             auto req = io_request::make_fdatasync(fd);
-            submit_io(desc, std::move(req));
+            _io_sink.submit(desc, std::move(req));
             return fut;
         });
     }
@@ -3342,11 +3358,15 @@ reactor::get_options_description(reactor_config cfg) {
         ("max-task-backlog", bpo::value<unsigned>()->default_value(1000), "Maximum number of task backlog to allow; above this we ignore I/O")
         ("blocked-reactor-notify-ms", bpo::value<unsigned>()->default_value(200), "threshold in miliseconds over which the reactor is considered blocked if no progress is made")
         ("blocked-reactor-reports-per-minute", bpo::value<unsigned>()->default_value(5), "Maximum number of backtraces reported by stall detector per minute")
+        ("blocked-reactor-report-format-oneline", bpo::value<bool>()->default_value(true), "Print a simplified backtrace on a single line")
         ("relaxed-dma", "allow using buffered I/O if DMA is not available (reduces performance)")
         ("linux-aio-nowait",
                 bpo::value<bool>()->default_value(aio_nowait_supported),
                 "use the Linux NOWAIT AIO feature, which reduces reactor stalls due to aio (autodetected)")
         ("unsafe-bypass-fsync", bpo::value<bool>()->default_value(false), "Bypass fsync(), may result in data loss. Use for testing on consumer drives")
+        ("kernel-page-cache", bpo::value<bool>()->default_value(false),
+                "Use the kernel page cache. This disables DMA (O_DIRECT)."
+                " Useful for short-lived functional tests with a small data set.")
         ("overprovisioned", "run in an overprovisioned environment (such as docker or a laptop); equivalent to --idle-poll-time-us 0 --thread-affinity 0 --poll-aio 0")
         ("abort-on-seastar-bad-alloc", "abort when seastar allocator cannot allocate memory")
         ("force-aio-syscalls", bpo::value<bool>()->default_value(false),
@@ -3424,7 +3444,6 @@ thread_local std::unique_ptr<reactor, reactor_deleter> reactor_holder;
 std::vector<posix_thread> smp::_threads;
 std::vector<std::function<void ()>> smp::_thread_loops;
 std::optional<boost::barrier> smp::_all_event_loops_done;
-std::vector<reactor*> smp::_reactors;
 std::unique_ptr<smp_message_queue*[], smp::qs_deleter> smp::_qs;
 std::thread::id smp::_tmain;
 unsigned smp::count = 1;
@@ -3584,6 +3603,7 @@ public:
         seastar_logger.debug("latency_goal: {}", latency_goal().count());
 
         if (configuration.count("max-io-requests")) {
+            seastar_logger.warn("the --max-io-requests option is deprecated, switch to io properties file instead");
             _capacity = configuration["max-io-requests"].as<unsigned>();
         }
 
@@ -3594,10 +3614,6 @@ public:
             }
         } else if (configuration.count("num-io-queues")) {
             seastar_logger.warn("the --num-io-queues option is deprecated, switch to --num-io-groups instead");
-            _num_io_groups = configuration["num-io-queues"].as<unsigned>();
-            if (!_num_io_groups) {
-                throw std::runtime_error("num-io-queues must be greater than zero");
-            }
         }
         if (configuration.count("io-properties-file") && configuration.count("io-properties")) {
             throw std::runtime_error("Both io-properties and io-properties-file specified. Don't know which to trust!");
@@ -3650,15 +3666,16 @@ public:
         seastar_logger.debug("generate_group_config dev_id: {}", devid);
         const mountpoint_params& p = _mountpoints.at(devid);
         struct io_group::config cfg;
-        uint64_t max_bandwidth = std::max(p.read_bytes_rate, p.write_bytes_rate);
-        uint64_t max_iops = std::max(p.read_req_rate, p.write_req_rate);
+
+        cfg.disk_req_write_to_read_multiplier = io_queue::read_request_base_count;
 
         if (!_capacity) {
-            if (max_bandwidth != std::numeric_limits<uint64_t>::max()) {
-                cfg.max_bytes_count = io_queue::read_request_base_count * per_io_group(max_bandwidth * latency_goal().count(), nr_groups);
+            if (p.read_bytes_rate != std::numeric_limits<uint64_t>::max()) {
+                cfg.max_bytes_count = io_queue::read_request_base_count * per_io_group(p.read_bytes_rate * latency_goal().count(), nr_groups);
             }
-            if (max_iops != std::numeric_limits<uint64_t>::max()) {
-                cfg.max_req_count = io_queue::read_request_base_count * per_io_group(max_iops * latency_goal().count(), nr_groups);
+            if (p.read_req_rate != std::numeric_limits<uint64_t>::max()) {
+                cfg.max_req_count = io_queue::read_request_base_count * per_io_group(p.read_req_rate * latency_goal().count(), nr_groups);
+                cfg.disk_req_write_to_read_multiplier = (io_queue::read_request_base_count * p.read_req_rate) / p.write_req_rate;
             }
         } else {
             // Legacy configuration when only concurrency is specified.
@@ -3673,21 +3690,25 @@ public:
         seastar_logger.debug("generate_config dev_id: {}", devid);
         const mountpoint_params& p = _mountpoints.at(devid);
         struct io_queue::config cfg;
-        uint64_t max_bandwidth = std::max(p.read_bytes_rate, p.write_bytes_rate);
-        uint64_t max_iops = std::max(p.read_req_rate, p.write_req_rate);
 
         cfg.devid = devid;
         cfg.disk_bytes_write_to_read_multiplier = io_queue::read_request_base_count;
         cfg.disk_req_write_to_read_multiplier = io_queue::read_request_base_count;
 
         if (!_capacity) {
-            if (max_bandwidth != std::numeric_limits<uint64_t>::max()) {
+            if (p.read_bytes_rate != std::numeric_limits<uint64_t>::max()) {
                 cfg.disk_bytes_write_to_read_multiplier = (io_queue::read_request_base_count * p.read_bytes_rate) / p.write_bytes_rate;
-                cfg.disk_us_per_byte = 1000000. / max_bandwidth;
+                cfg.disk_us_per_byte = 1000000. / p.read_bytes_rate;
             }
-            if (max_iops != std::numeric_limits<uint64_t>::max()) {
+            if (p.read_req_rate != std::numeric_limits<uint64_t>::max()) {
                 cfg.disk_req_write_to_read_multiplier = (io_queue::read_request_base_count * p.read_req_rate) / p.write_req_rate;
-                cfg.disk_us_per_request = 1000000. / max_iops;
+                cfg.disk_us_per_request = 1000000. / p.read_req_rate;
+            }
+            if (p.read_saturation_length != std::numeric_limits<uint64_t>::max()) {
+                cfg.disk_read_saturation_length = p.read_saturation_length;
+            }
+            if (p.write_saturation_length != std::numeric_limits<uint64_t>::max()) {
+                cfg.disk_write_saturation_length = p.write_saturation_length;
             }
             cfg.mountpoint = p.mountpoint;
         } else {
@@ -3794,7 +3815,7 @@ void smp::configure(boost::program_options::variables_map configuration, reactor
         nr_cpus = cpu_set.size();
     }
     smp::count = nr_cpus;
-    _reactors.resize(nr_cpus);
+    std::vector<reactor*> reactors(nr_cpus);
     resource::configuration rc;
     if (configuration.count("memory")) {
         rc.total_memory = parse_memory_size(configuration["memory"].as<std::string>());
@@ -3928,7 +3949,7 @@ void smp::configure(boost::program_options::variables_map configuration, reactor
         }
 
         struct io_queue::config cfg = disk_config.generate_config(id);
-        topology.queues[shard] = new io_queue(std::move(group), std::move(cfg));
+        topology.queues[shard] = new io_queue(std::move(group), engine()._io_sink, std::move(cfg));
         seastar_logger.debug("attached {} queue to {} IO group", shard, group_idx);
     };
 
@@ -3944,7 +3965,7 @@ void smp::configure(boost::program_options::variables_map configuration, reactor
     unsigned i;
     for (i = 1; i < smp::count; i++) {
         auto allocation = allocations[i];
-        create_thread([configuration, &disk_config, hugepages_path, i, allocation, assign_io_queue, alloc_io_queue, thread_affinity, heapprof_enabled, mbind, backend_selector, reactor_cfg] {
+        create_thread([configuration, &reactors, &disk_config, hugepages_path, i, allocation, assign_io_queue, alloc_io_queue, thread_affinity, heapprof_enabled, mbind, backend_selector, reactor_cfg] {
           try {
             auto thread_name = seastar::format("reactor-{}", i);
             pthread_setname_np(pthread_self(), thread_name.c_str());
@@ -3964,7 +3985,7 @@ void smp::configure(boost::program_options::variables_map configuration, reactor
             throw_pthread_error(r);
             init_default_smp_service_group(i);
             allocate_reactor(i, backend_selector, reactor_cfg);
-            _reactors[i] = &engine();
+            reactors[i] = &engine();
             for (auto& dev_id : disk_config.device_ids()) {
                 alloc_io_queue(i, dev_id);
             }
@@ -3992,7 +4013,7 @@ void smp::configure(boost::program_options::variables_map configuration, reactor
         _exit(1);
     }
 
-    _reactors[0] = &engine();
+    reactors[0] = &engine();
     for (auto& dev_id : disk_config.device_ids()) {
         alloc_io_queue(0, dev_id);
     }
@@ -4011,10 +4032,10 @@ void smp::configure(boost::program_options::variables_map configuration, reactor
     for(unsigned i = 0; i < smp::count; i++) {
         smp::_qs[i] = reinterpret_cast<smp_message_queue*>(operator new[] (sizeof(smp_message_queue) * smp::count));
         for (unsigned j = 0; j < smp::count; ++j) {
-            new (&smp::_qs[i][j]) smp_message_queue(_reactors[j], _reactors[i]);
+            new (&smp::_qs[i][j]) smp_message_queue(reactors[j], reactors[i]);
         }
     }
-    alien::smp::_qs = alien::smp::create_qs(_reactors);
+    alien::smp::_qs = alien::smp::create_qs(reactors);
     smp_queues_constructed.wait();
     start_all_queues();
     for (auto& dev_id : disk_config.device_ids()) {
@@ -4057,9 +4078,6 @@ bool smp::pure_poll_queues() {
     }
     return false;
 }
-
-internal::preemption_monitor bootstrap_preemption_monitor{};
-__thread const internal::preemption_monitor* g_need_preempt = &bootstrap_preemption_monitor;
 
 __thread reactor* local_engine;
 

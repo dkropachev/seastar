@@ -81,8 +81,14 @@ set_property (CACHE Seastar_API_LEVEL
 # fast build/test iteration.
 #
 
+if (CMAKE_CXX_COMPILER_ID MATCHES Clang)
+  set (CMAKE_CXX_FLAGS_DEV_OPT_LEVEL "-O2")
+else ()
+  set (CMAKE_CXX_FLAGS_DEV_OPT_LEVEL "-O1")
+endif ()
+
 set (CMAKE_CXX_FLAGS_DEV
-  "-O1"
+  "${CMAKE_CXX_FLAGS_DEV_OPT_LEVEL}"
   CACHE
   STRING
   "Flags used by the C++ compiler during dev builds."
@@ -413,6 +419,12 @@ endfunction ()
 #
 
 seastar_generate_ragel (
+  TARGET seastar_http_chunk_parsers
+  VAR http_chunk_parsers_file
+  IN_FILE ${CMAKE_CURRENT_SOURCE_DIR}/src/http/chunk_parsers.rl
+  OUT_FILE ${Seastar_GEN_BINARY_DIR}/include/seastar/http/chunk_parsers.hh)
+
+seastar_generate_ragel (
   TARGET seastar_http_request_parser
   VAR http_request_parser_file
   IN_FILE ${CMAKE_CURRENT_SOURCE_DIR}/src/http/request_parser.rl
@@ -435,6 +447,7 @@ if (Seastar_DPDK)
 endif ()
 
 add_library (seastar STATIC
+  ${http_chunk_parsers_file}
   ${http_request_parser_file}
   ${proto_metrics2_files}
   ${seastar_dpdk_obj}
@@ -546,6 +559,7 @@ add_library (seastar STATIC
   include/seastar/http/reply.hh
   include/seastar/http/request.hh
   include/seastar/http/routes.hh
+  include/seastar/http/short_streams.hh
   include/seastar/http/transformers.hh
   include/seastar/json/formatter.hh
   include/seastar/json/json_elements.hh
@@ -610,6 +624,7 @@ add_library (seastar STATIC
   include/seastar/util/transform_iterator.hh
   include/seastar/util/tuple_utils.hh
   include/seastar/util/variant_utils.hh
+  include/seastar/util/closeable.hh
   src/core/alien.cc
   src/core/file.cc
   src/core/fair_queue.cc
@@ -654,6 +669,7 @@ add_library (seastar STATIC
   src/http/mime_types.cc
   src/http/reply.cc
   src/http/routes.cc
+  src/http/short_streams.cc
   src/http/transformers.cc
   src/json/formatter.cc
   src/json/json_elements.cc
@@ -695,6 +711,7 @@ add_library (seastar STATIC
 add_library (Seastar::seastar ALIAS seastar)
 
 add_dependencies (seastar
+  seastar_http_chunk_parsers
   seastar_http_request_parser
   seastar_http_response_parser
   seastar_proto_metrics2)
@@ -782,9 +799,9 @@ target_compile_definitions(seastar
   SEASTAR_API_LEVEL=${Seastar_API_LEVEL})
 
 function (seastar_supports_flag flag var)
-  set (CMAKE_REQUIRED_FLAGS ${flag})
-  check_cxx_source_compiles ("int main() { return 0; }" result)
-  set (${var} ${result} PARENT_SCOPE)
+  set (CMAKE_REQUIRED_FLAGS "${flag}")
+  check_cxx_source_compiles ("int main() { return 0; }" tmp_${var})
+  set (${var} ${tmp_${var}} PARENT_SCOPE)
 endfunction ()
 
 seastar_supports_flag ("-Wno-maybe-uninitialized -Werror" MaybeUninitialized_FOUND)
@@ -941,6 +958,12 @@ if (ErrorUnused_FOUND)
   endif ()
 endif ()
 
+seastar_supports_flag ("-Wno-error=#warnings" ErrorWarnings_FOUND)
+if (ErrorWarnings_FOUND)
+  target_compile_options (seastar
+      PUBLIC "-Wno-error=#warnings")
+endif ()
+
 if ((CMAKE_BUILD_TYPE STREQUAL "Debug") OR (CMAKE_BUILD_TYPE STREQUAL "Sanitize"))
   target_compile_definitions (seastar
     PUBLIC
@@ -962,7 +985,9 @@ set (Seastar_STACK_GUARD_MODES "Debug" "Sanitize" "Dev")
 if ((Seastar_STACK_GUARDS STREQUAL "ON") OR
     ((Seastar_STACK_GUARDS STREQUAL "DEFAULT") AND
      (CMAKE_BUILD_TYPE IN_LIST Seastar_STACK_GUARD_MODES)))
-  seastar_supports_flag ("-fstack-clash-protection" StackClashProtection_FOUND)
+  # check for -fstack-clash-protection together with -Werror, because
+  # otherwise clang can soft-fail (return 0 but emit a warning) instead.
+  seastar_supports_flag ("-fstack-clash-protection -Werror" StackClashProtection_FOUND)
   if (StackClashProtection_FOUND)
     target_compile_options (seastar
       PUBLIC

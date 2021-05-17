@@ -81,6 +81,7 @@
 #include <seastar/core/scheduling_specific.hh>
 #include <seastar/core/smp.hh>
 #include <seastar/core/internal/io_request.hh>
+#include <seastar/core/internal/io_sink.hh>
 #include <seastar/core/make_task.hh>
 #include "internal/pollable_fd.hh"
 #include "internal/poll.hh"
@@ -174,6 +175,7 @@ public:
 
 class kernel_completion;
 class io_queue;
+class io_intent;
 class disk_config_params;
 
 class io_completion : public kernel_completion {
@@ -232,6 +234,13 @@ public:
         uint64_t fstream_read_aheads_discarded = 0;
         uint64_t fstream_read_ahead_discarded_bytes = 0;
     };
+    /// Scheduling statistics.
+    struct sched_stats {
+        /// Total number of tasks processed by this shard's reactor until this point.
+        /// Note that tasks can be tiny, running for a few nanoseconds, or can take an
+        /// entire task quota.
+        uint64_t tasks_processed = 0;
+    };
     friend void io_completion::complete_with(ssize_t);
 
 private:
@@ -256,10 +265,10 @@ private:
     static constexpr unsigned max_aio = max_aio_per_queue * max_queues;
     friend disk_config_params;
 
-    // Not all reactors have IO queues. If the number of IO queues is less than the number of shards,
-    // some reactors will talk to foreign io_queues. If this reactor holds a valid IO queue, it will
-    // be stored here.
+    // Each mountpouint is controlled by its own io_queue, but ...
     std::unordered_map<dev_t, std::unique_ptr<io_queue>> _io_queues;
+    // ... when dispatched all requests get into this single sink
+    internal::io_sink _io_sink;
 
     std::vector<noncopyable_function<future<> ()>> _exit_funcs;
     unsigned _id = 0;
@@ -313,7 +322,6 @@ private:
         void register_stats();
     };
 
-    circular_buffer<internal::io_request> _pending_io;
     boost::container::static_vector<std::unique_ptr<task_queue>, max_scheduling_groups()> _task_queues;
     internal::scheduling_group_specific_thread_local_data _scheduling_group_specific_data;
     int64_t _last_vruntime = 0;
@@ -351,6 +359,7 @@ private:
     bool _force_io_getevents_syscall = false;
     bool _bypass_fsync = false;
     bool _have_aio_fsync = false;
+    bool _kernel_page_cache = false;
     std::atomic<bool> _dying{false};
 private:
     static std::chrono::nanoseconds calculate_poll_time();
@@ -414,7 +423,6 @@ private:
     void run_tasks(task_queue& tq);
     bool have_more_tasks() const;
     bool posix_reuseport_detect();
-    void task_quota_timer_thread_fn();
     void run_some_tasks();
     void activate(task_queue& tq);
     void insert_active_task_queue(task_queue* tq);
@@ -521,15 +529,16 @@ public:
     // In the following three methods, prepare_io is not guaranteed to execute in the same processor
     // in which it was generated. Therefore, care must be taken to avoid the use of objects that could
     // be destroyed within or at exit of prepare_io.
-    void submit_io(io_completion* desc, internal::io_request req) noexcept;
     future<size_t> submit_io_read(io_queue* ioq,
             const io_priority_class& priority_class,
             size_t len,
-            internal::io_request req) noexcept;
+            internal::io_request req,
+            io_intent* intent) noexcept;
     future<size_t> submit_io_write(io_queue* ioq,
             const io_priority_class& priority_class,
             size_t len,
-            internal::io_request req) noexcept;
+            internal::io_request req,
+            io_intent* intent) noexcept;
 
     int run();
     void exit(int ret);
@@ -606,6 +615,12 @@ public:
     std::chrono::nanoseconds total_steal_time();
 
     const io_stats& get_io_stats() const { return _io_stats; }
+    /// Returns statistics related to scheduling. The statistics are
+    /// local to this shard.
+    ///
+    /// See \ref sched_stats for a description of individual statistics.
+    /// \return An object containing a snapshot of the statistics at this point in time.
+    sched_stats get_sched_stats() const;
     uint64_t abandoned_failed_futures() const { return _abandoned_failed_futures; }
 #ifdef HAVE_OSV
     void timer_thread_func();

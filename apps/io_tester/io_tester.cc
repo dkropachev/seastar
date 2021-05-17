@@ -31,6 +31,7 @@
 #include <seastar/core/print.hh>
 #include <seastar/core/loop.hh>
 #include <seastar/core/with_scheduling_group.hh>
+#include <seastar/core/metrics_api.hh>
 #include <chrono>
 #include <vector>
 #include <boost/range/irange.hpp>
@@ -55,9 +56,6 @@ using namespace boost::accumulators;
 
 static auto random_seed = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
 static std::default_random_engine random_generator(random_seed);
-// size of each individual file. Every class will have its file, so in a normal system with many shards, we'll naturally have many files and
-// that will push the data out of the disk's cache. And static sizes per file are simpler.
-static constexpr uint64_t file_data_size = 1ull << 30;
 
 class context;
 enum class request_type { seqread, seqwrite, randread, randwrite, append, cpu };
@@ -114,10 +112,16 @@ struct job_config {
     shard_config shard_placement;
     ::shard_info shard_info;
     ::options options;
+    // size of each individual file. Every class and every shard have its file, so in a normal
+    // system with many shards we'll naturally have many files and that will push the data out
+    // of the disk's cache
+    uint64_t file_size;
+    uint64_t offset_in_bdev;
     std::unique_ptr<class_data> gen_class_data();
 };
 
 std::array<double, 4> quantiles = { 0.5, 0.95, 0.99, 0.999};
+static bool keep_files = false;
 
 class class_data {
 protected:
@@ -126,6 +130,7 @@ protected:
     job_config _config;
     uint64_t _alignment;
     uint64_t _last_pos = 0;
+    uint64_t _offset = 0;
 
     io_priority_class _iop;
     seastar::scheduling_group _sg;
@@ -139,17 +144,16 @@ protected:
     std::uniform_int_distribution<uint32_t> _pos_distribution;
     file _file;
 
-    virtual future<> do_start(sstring dir) = 0;
+    virtual future<> do_start(sstring dir, directory_entry_type type) = 0;
     virtual future<size_t> issue_request(char *buf) = 0;
 public:
-    static int idgen();
     class_data(job_config cfg)
         : _config(std::move(cfg))
         , _alignment(_config.shard_info.request_size >= 4096 ? 4096 : 512)
-        , _iop(engine().register_one_priority_class(format("test-class-{:d}", idgen()), _config.shard_info.shares))
+        , _iop(engine().register_one_priority_class(name(), _config.shard_info.shares))
         , _sg(cfg.shard_info.scheduling_group)
         , _latencies(extended_p_square_probabilities = quantiles)
-        , _pos_distribution(0,  file_data_size / _config.shard_info.request_size)
+        , _pos_distribution(0,  _config.file_size / _config.shard_info.request_size)
     {}
 
     virtual ~class_data() = default;
@@ -193,8 +197,8 @@ public:
     // random writes     : will overwrite the file at a random position, between 0 and EOF
     // append            : will write to the file from pos = EOF onwards, always appending to the end.
     // cpu               : CPU-only load, file is not created.
-    future<> start(sstring dir) {
-        return do_start(dir);
+    future<> start(sstring dir, directory_entry_type type) {
+        return do_start(dir, type);
     }
 
     future<> stop() {
@@ -203,6 +207,11 @@ public:
         }
         return make_ready_future<>();
     }
+
+    const sstring name() const {
+        return _config.name;
+    }
+
 protected:
     sstring type_str() const {
         return std::unordered_map<request_type, sstring>{
@@ -213,10 +222,6 @@ protected:
             { request_type::append , "APPEND" },
             { request_type::cpu , "CPU" },
         }[_config.type];;
-    }
-
-   const sstring name() const {
-        return _config.name;
     }
 
     request_type req_type() const {
@@ -245,6 +250,10 @@ protected:
 
     std::chrono::duration<float> total_duration() const {
         return _total_duration;
+    }
+
+    uint64_t file_size_mb() const {
+        return _config.file_size >> 20;
     }
 
     uint64_t total_data() const {
@@ -280,12 +289,12 @@ protected:
             pos = _pos_distribution(random_generator) * req_size();
         } else {
             pos = _last_pos + req_size();
-            if (is_sequential() && (pos >= file_data_size)) {
+            if (is_sequential() && (pos >= _config.file_size)) {
                 pos = 0;
             }
         }
         _last_pos = pos;
-        return pos;
+        return pos + _offset;
     }
 
     void add_result(size_t data, std::chrono::microseconds latency) {
@@ -295,63 +304,125 @@ protected:
     }
 
 public:
-    virtual sstring describe_class() = 0;
-    virtual sstring describe_results() = 0;
+    virtual void emit_results(YAML::Emitter& out) = 0;
 };
 
 class io_class_data : public class_data {
 public:
     io_class_data(job_config cfg) : class_data(std::move(cfg)) {}
 
-    future<> do_start(sstring dir) override {
+    future<> do_start(sstring path, directory_entry_type type) override {
+        if (type == directory_entry_type::directory) {
+            return do_start_on_directory(path);
+        }
+
+        if (type == directory_entry_type::block_device) {
+            return do_start_on_bdev(path);
+        }
+
+        throw std::runtime_error(format("Unsupported storage. {} should be directory or block device", path));
+    }
+
+private:
+    future<> do_start_on_directory(sstring dir) {
         auto fname = format("{}/test-{}-{:d}", dir, name(), this_shard_id());
-        auto flags = open_flags::rw | open_flags::create | open_flags::truncate;
+        auto flags = open_flags::rw | open_flags::create;
         if (_config.options.dsync) {
             flags |= open_flags::dsync;
         }
-        return open_file_dma(fname, flags).then([this, fname] (auto f) {
+        file_open_options options;
+        options.extent_allocation_size_hint = _config.file_size;
+        options.append_is_unlikely = true;
+        return open_file_dma(fname, flags, options).then([this, fname] (auto f) {
             _file = f;
-            return remove_file(fname);
-        }).then([this, fname] {
-            return do_with(seastar::semaphore(64), [this] (auto& write_parallelism) mutable {
-                auto bufsize = 256ul << 10;
-                auto pos = boost::irange(0ul, (file_data_size / bufsize) + 1);
-                return parallel_for_each(pos.begin(), pos.end(), [this, bufsize, &write_parallelism] (auto pos) mutable {
-                    return get_units(write_parallelism, 1).then([this, bufsize, pos] (auto perm) mutable {
-                        auto bufptr = allocate_aligned_buffer<char>(bufsize, 4096);
-                        auto buf = bufptr.get();
-                        std::uniform_int_distribution<char> fill('@', '~');
-                        memset(buf, fill(random_generator), bufsize);
-                        pos = pos * bufsize;
-                        return _file.dma_write(pos, buf, bufsize).finally([this, bufptr = std::move(bufptr), perm = std::move(perm), pos] {
-                            if ((this->req_type() == request_type::append) && (pos > _last_pos)) {
-                                _last_pos = pos;
-                            }
-                        }).discard_result();
+            auto maybe_remove_file = [] (sstring fname) {
+                return keep_files ? make_ready_future<>() : remove_file(fname);
+            };
+            return maybe_remove_file(fname).then([this] {
+                return _file.size().then([this] (uint64_t size) {
+                    return _file.truncate(_config.file_size).then([this, size] {
+                        if (size >= _config.file_size) {
+                            return make_ready_future<>();
+                        }
+
+                        auto bufsize = 256ul << 10;
+                        return do_with(boost::irange(0ul, (_config.file_size / bufsize) + 1), [this, bufsize] (auto& pos) mutable {
+                            return max_concurrent_for_each(pos.begin(), pos.end(), 64, [this, bufsize] (auto pos) mutable {
+                                auto bufptr = allocate_aligned_buffer<char>(bufsize, 4096);
+                                auto buf = bufptr.get();
+                                std::uniform_int_distribution<char> fill('@', '~');
+                                memset(buf, fill(random_generator), bufsize);
+                                pos = pos * bufsize;
+                                return _file.dma_write(pos, buf, bufsize).finally([this, bufptr = std::move(bufptr), pos] {
+                                    if ((this->req_type() == request_type::append) && (pos > _last_pos)) {
+                                        _last_pos = pos;
+                                    }
+                                }).discard_result();
+                            });
+                        }).then([this] {
+                            return _file.flush();
+                        });
                     });
                 });
             });
-        }).then([this] {
-            return _file.flush();
         });
     }
 
-    virtual sstring describe_class() override {
-        return fmt::format("{}: {} shares, {}-byte {}, {} concurrent requests, {}", name(), shares(), req_size(), type_str(), parallelism(), think_time());
+    future<> do_start_on_bdev(sstring name) {
+        auto flags = open_flags::rw;
+        if (_config.options.dsync) {
+            flags |= open_flags::dsync;
+        }
+
+        return open_file_dma(name, flags).then([this] (auto f) {
+            _file = std::move(f);
+            return _file.size().then([this] (uint64_t size) {
+                auto shard_area_size = align_down<uint64_t>(size / smp::count, 1 << 20);
+                if (_config.offset_in_bdev + _config.file_size > shard_area_size) {
+                    throw std::runtime_error("Data doesn't fit the blockdevice");
+                }
+                _offset = shard_area_size * this_shard_id() + _config.offset_in_bdev;
+                return make_ready_future<>();
+            });
+        });
     }
 
-    virtual sstring describe_results() override {
+    void emit_one_metrics(YAML::Emitter& out, sstring m_name) {
+        const auto& values = seastar::metrics::impl::get_value_map();
+        const auto& mf = values.find(m_name);
+        assert(mf != values.end());
+        for (auto&& mi : mf->second) {
+            auto&& cname = mi.first.find("class");
+            if (cname != mi.first.end() && cname->second == name()) {
+                out << YAML::Key << m_name << YAML::Value << mi.second->get_function()().d();
+            }
+        }
+    }
+
+    void emit_metrics(YAML::Emitter& out) {
+        emit_one_metrics(out, "io_queue_total_exec_sec");
+        emit_one_metrics(out, "io_queue_total_delay_sec");
+        emit_one_metrics(out, "io_queue_total_operations");
+    }
+
+public:
+    virtual void emit_results(YAML::Emitter& out) override {
         auto throughput_kbs = (total_data() >> 10) / total_duration().count();
         auto iops = requests() / total_duration().count();
-        sstring result;
-        result += fmt::format("  Throughput         : {:>8} KB/s\n", throughput_kbs);
-        result += fmt::format("  IOPS               : {:>8}\n", iops);
-        result += fmt::format("  Lat average        : {:>8} usec\n", average_latency());
+        out << YAML::Key << "throughput" << YAML::Value << throughput_kbs << YAML::Comment("kB/s");
+        out << YAML::Key << "IOPS" << YAML::Value << iops;
+        out << YAML::Key << "latencies" << YAML::Comment("usec");
+        out << YAML::BeginMap;
+        out << YAML::Key << "average" << YAML::Value << average_latency();
         for (auto& q: quantiles) {
-            result += fmt::format("  Lat quantile={:>5} : {:>8} usec\n", q, quantile_latency(q));
+            out << YAML::Key << fmt::format("p{}", q) << YAML::Value << quantile_latency(q);
         }
-        result += fmt::format("  Lat max            : {:>8} usec\n", max_latency());
-        return result;
+        out << YAML::Key << "max" << YAML::Value << max_latency();
+        out << YAML::EndMap;
+        out << YAML::Key << "stats" << YAML::BeginMap;
+        out << YAML::Key << "total_requests" << YAML::Value << requests();
+        emit_metrics(out);
+        out << YAML::EndMap;
     }
 };
 
@@ -377,7 +448,7 @@ class cpu_class_data : public class_data {
 public:
     cpu_class_data(job_config cfg) : class_data(std::move(cfg)) {}
 
-    future<> do_start(sstring dir) override {
+    future<> do_start(sstring dir, directory_entry_type type) override {
         return make_ready_future<>();
     }
 
@@ -391,14 +462,9 @@ public:
         return make_ready_future<size_t>(1);
     }
 
-    virtual sstring describe_class() override {
-        auto exec = std::chrono::duration_cast<std::chrono::microseconds>(_config.shard_info.execution_time);
-        return fmt::format("{}: {} shares, {} us CPU execution time, {} concurrent requests, {}", name(), shares(), exec.count(), parallelism(), think_time());
-    }
-
-    virtual sstring describe_results() override {
+    virtual void emit_results(YAML::Emitter& out) override {
         auto throughput = total_data() / total_duration().count();
-        return fmt::format("  Throughput         : {:>8} continuations/s\n", throughput);
+        out << YAML::Key << "throughput" << YAML::Value << throughput;
     }
 };
 
@@ -534,6 +600,14 @@ struct convert<job_config> {
         cl.name = node["name"].as<std::string>();
         cl.type = node["type"].as<request_type>();
         cl.shard_placement = node["shards"].as<shard_config>();
+        // The data_size is used to divide the available (and effectively
+        // constant) disk space between workloads. Each shard inside the
+        // workload thus uses its portion of the assigned space.
+        if (node["data_size"]) {
+            cl.file_size = node["data_size"].as<byte_size>().size / smp::count;
+        } else {
+            cl.file_size = 1ull << 30; // 1G by default
+        }
         if (node["shard_info"]) {
             cl.shard_info = node["shard_info"].as<shard_info>();
         }
@@ -551,16 +625,18 @@ class context {
     std::vector<std::unique_ptr<class_data>> _cl;
 
     sstring _dir;
+    directory_entry_type _type;
     std::chrono::seconds _duration;
 
     semaphore _finished;
 public:
-    context(sstring dir, std::vector<job_config> req_config, unsigned duration)
+    context(sstring dir, directory_entry_type dtype, std::vector<job_config> req_config, unsigned duration)
             : _cl(boost::copy_range<std::vector<std::unique_ptr<class_data>>>(req_config
                 | boost::adaptors::filtered([] (auto& cfg) { return cfg.shard_placement.is_set(this_shard_id()); })
                 | boost::adaptors::transformed([] (auto& cfg) { return cfg.gen_class_data(); })
             ))
             , _dir(dir)
+            , _type(dtype)
             , _duration(duration)
             , _finished(0)
     {}
@@ -573,7 +649,7 @@ public:
 
     future<> start() {
         return parallel_for_each(_cl, [this] (std::unique_ptr<class_data>& cl) {
-            return cl->start(_dir);
+            return cl->start(_dir, _type);
         });
     }
 
@@ -585,22 +661,34 @@ public:
         });
     }
 
-    future<> print_stats() {
-        return _finished.wait(_cl.size()).then([this] {
-            fmt::print("Shard {:>2}\n", this_shard_id());
-            auto idx = 0;
+    future<> emit_results(YAML::Emitter& out) {
+        return _finished.wait(_cl.size()).then([this, &out] {
             for (auto& cl: _cl) {
-                fmt::print("Class {:>2} ({})\n", idx++, cl->describe_class());
-                fmt::print("{}\n", cl->describe_results());
+                out << YAML::Key << cl->name();
+                out << YAML::BeginMap;
+                cl->emit_results(out);
+                out << YAML::EndMap;
             }
             return make_ready_future<>();
         });
     }
 };
 
-int class_data::idgen() {
-    static thread_local int id = 0;
-    return id++;
+static void show_results(distributed<context>& ctx) {
+    YAML::Emitter out;
+    out << YAML::BeginDoc;
+    out << YAML::BeginSeq;
+    for (unsigned i = 0; i < smp::count; ++i) {
+        out << YAML::BeginMap;
+        out << YAML::Key << "shard" << YAML::Value << i;
+        ctx.invoke_on(i, [&out] (auto& c) {
+            return c.emit_results(out);
+        }).get();
+        out << YAML::EndMap;
+    }
+    out << YAML::EndSeq;
+    out << YAML::EndDoc;
+    std::cout << out.c_str();
 }
 
 int main(int ac, char** av) {
@@ -609,22 +697,32 @@ int main(int ac, char** av) {
     app_template app;
     auto opt_add = app.add_options();
     opt_add
-        ("directory", bpo::value<sstring>()->default_value("."), "directory where to execute the test")
+        ("storage", bpo::value<sstring>()->default_value("."), "directory or block device where to execute the test")
         ("duration", bpo::value<unsigned>()->default_value(10), "for how long (in seconds) to run the test")
         ("conf", bpo::value<sstring>()->default_value("./conf.yaml"), "YAML file containing benchmark specification")
+        ("keep-files", bpo::value<bool>()->default_value(false), "keep test files, next run may re-use them")
     ;
 
     distributed<context> ctx;
     return app.run(ac, av, [&] {
         return seastar::async([&] {
             auto& opts = app.configuration();
-            auto& directory = opts["directory"].as<sstring>();
+            auto& storage = opts["storage"].as<sstring>();
 
-            auto fs = file_system_at(directory).get0();
-            if (fs != fs_type::xfs) {
-                throw std::runtime_error(format("This is a performance test. {} is not on XFS", directory));
+            auto st_type = engine().file_type(storage).get0();
+
+            if (!st_type) {
+                throw std::runtime_error(format("Unknown storage {}", storage));
             }
 
+            if (*st_type == directory_entry_type::directory) {
+                auto fs = file_system_at(storage).get0();
+                if (fs != fs_type::xfs) {
+                    throw std::runtime_error(format("This is a performance test. {} is not on XFS", storage));
+                }
+            }
+
+            keep_files = opts["keep-files"].as<bool>();
             auto& duration = opts["duration"].as<unsigned>();
             auto& yaml = opts["conf"].as<sstring>();
             YAML::Node doc = YAML::LoadFile(yaml);
@@ -636,7 +734,15 @@ int main(int ac, char** av) {
                 });
             }).get();
 
-            ctx.start(directory, reqs, duration).get0();
+            if (*st_type == directory_entry_type::block_device) {
+                uint64_t off = 0;
+                for (job_config& r : reqs) {
+                    r.offset_in_bdev = off;
+                    off += r.file_size;
+                }
+            }
+
+            ctx.start(storage, *st_type, reqs, duration).get0();
             engine().at_exit([&ctx] {
                 return ctx.stop();
             });
@@ -648,11 +754,7 @@ int main(int ac, char** av) {
             ctx.invoke_on_all([] (auto& c) {
                 return c.issue_requests();
             }).get();
-            for (unsigned i = 0; i < smp::count; ++i) {
-                ctx.invoke_on(i, [] (auto& c) {
-                    return c.print_stats();
-                }).get();
-            }
+            show_results(ctx);
             ctx.stop().get0();
         }).or_terminate();
     });

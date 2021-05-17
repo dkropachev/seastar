@@ -250,6 +250,9 @@ seastar_add_test (checked_ptr
 seastar_add_test (chunked_fifo
   SOURCES chunked_fifo_test.cc)
 
+seastar_add_test (chunk_parsers
+  SOURCES chunk_parsers_test.cc)
+
 seastar_add_test (circular_buffer
   SOURCES circular_buffer_test.cc)
 
@@ -258,6 +261,9 @@ seastar_add_test (circular_buffer_fixed_capacity
 
 seastar_add_test (connect
   SOURCES connect_test.cc)
+
+seastar_add_test (content_source
+  SOURCES content_source_test.cc)
 
 seastar_add_test (coroutines
   SOURCES coroutines_test.cc)
@@ -282,6 +288,9 @@ seastar_add_test (execution_stage
 
 seastar_add_test (expiring_fifo
   SOURCES expiring_fifo_test.cc)
+
+seastar_add_test (io_queue
+  SOURCES io_queue_test.cc)
 
 seastar_add_test (fair_queue
   SOURCES fair_queue_test.cc)
@@ -393,6 +402,9 @@ seastar_add_test (sstring
 
 seastar_add_test (stall_detector
   SOURCES stall_detector_test.cc)
+
+seastar_add_test (stream_reader
+  SOURCES stream_reader_test.cc)
 
 seastar_add_test (thread
   SOURCES thread_test.cc)
@@ -558,3 +570,10 @@ seastar_add_test (weak_ptr
 
 seastar_add_test (log_buf
   SOURCES log_buf_test.cc)
+
+seastar_add_test (exception_logging
+  KIND BOOST
+  SOURCES exception_logging_test.cc)
+
+seastar_add_test (closeable
+  SOURCES closeable_test.cc)
