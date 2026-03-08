@@ -338,10 +338,16 @@ public:
 /// \addtogroup networking-module
 /// @{
 
+/// Metadata about an accepted connection, populated by master port protocol detection.
+struct connection_metadata {
+    bool is_tls = false;  ///< Whether TLS follows (detected by master port logic)
+};
+
 /// The result of an server_socket::accept() call
 struct accept_result {
     connected_socket connection;  ///< The newly-accepted connection
     socket_address remote_address;  ///< The address of the peer that connected to us
+    connection_metadata metadata;  ///< Additional metadata from protocol detection
 };
 
 /// A listening socket, waiting to accept incoming network connections.
@@ -451,6 +457,13 @@ struct listen_options {
     //
     // The proxy protocol is defined in https://www.haproxy.org/download/1.8/doc/proxy-protocol.txt
     bool proxy_protocol = false;
+
+    // Master port mode: auto-detects proxy protocol v2, shard selection header,
+    // and TLS vs plain CQL on a single port. When enabled, proxy_protocol and lba
+    // settings are ignored — the master port handles protocol detection and shard
+    // routing internally. Connections with a shard selection header are routed to
+    // the requested shard; legacy connections use connection_distribution LBA.
+    bool master_port = false;
 };
 
 class network_interface {

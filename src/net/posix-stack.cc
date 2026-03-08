@@ -674,6 +674,56 @@ read_proxy_data(pollable_fd& fd) {
     co_return addr_data;
 }
 
+// Data source that yields prefix bytes before delegating to the underlying source.
+// Used by master port to prepend bytes consumed during protocol detection.
+class prefixed_data_source_impl final : public data_source_impl {
+    temporary_buffer<char> _prefix;
+    data_source _underlying;
+public:
+    prefixed_data_source_impl(temporary_buffer<char> prefix, data_source underlying)
+        : _prefix(std::move(prefix)), _underlying(std::move(underlying)) {}
+    future<temporary_buffer<char>> get() override {
+        if (!_prefix.empty()) {
+            return make_ready_future<temporary_buffer<char>>(std::move(_prefix));
+        }
+        return _underlying.get();
+    }
+    future<> close() override {
+        return _underlying.close();
+    }
+};
+
+// Connected socket that prepends prefix bytes to the data stream.
+// Used by master port for legacy clients where the first byte was consumed during detection.
+class prefixed_posix_connected_socket_impl final : public posix_connected_socket_impl {
+    std::vector<char> _prefix;
+public:
+    prefixed_posix_connected_socket_impl(
+            sa_family_t family, int protocol, pollable_fd fd,
+            conntrack::handle&& handle,
+            std::vector<char> prefix,
+            std::pmr::polymorphic_allocator<char>* allocator = memory::malloc_allocator)
+        : posix_connected_socket_impl(family, protocol, std::move(fd), std::move(handle), allocator)
+        , _prefix(std::move(prefix)) {}
+    data_source source() override {
+        return source(connected_socket_input_stream_config());
+    }
+    data_source source(connected_socket_input_stream_config csisc) override {
+        auto underlying = posix_connected_socket_impl::source(csisc);
+        if (_prefix.empty()) {
+            return underlying;
+        }
+        temporary_buffer<char> pfx(_prefix.size());
+        std::copy(_prefix.begin(), _prefix.end(), pfx.get_write());
+        _prefix.clear();
+        return data_source(std::make_unique<prefixed_data_source_impl>(
+            std::move(pfx), std::move(underlying)));
+    }
+};
+
+// Magic byte for the master port shard selection header.
+static constexpr char master_port_shard_select_magic = '\xAA';
+
 static
 std::unique_ptr<connected_socket_impl>
 make_maybe_proxied_connected_socket_impl(
@@ -702,8 +752,167 @@ make_maybe_proxied_connected_socket_impl(
     }
 }
 
+static
+std::unique_ptr<connected_socket_impl>
+make_master_port_connected_socket_impl(
+        sa_family_t family,
+        int protocol,
+        pollable_fd fd,
+        conntrack::handle&& handle,
+        std::optional<proxy_data> addr_data_opt,
+        std::vector<char> prefix,
+        std::pmr::polymorphic_allocator<char>* allocator = memory::malloc_allocator) {
+    if (!prefix.empty()) {
+        return std::make_unique<prefixed_posix_connected_socket_impl>(
+            family, protocol, std::move(fd), std::move(handle),
+            std::move(prefix), allocator);
+    }
+    return make_maybe_proxied_connected_socket_impl(
+        family, protocol, std::move(fd), std::move(handle),
+        std::move(addr_data_opt), allocator);
+}
+
+future<accept_result>
+posix_server_socket_impl::accept_master_port() {
+    while (true) {
+        auto [fd, sa] = co_await _lfd.accept();
+
+        std::optional<proxy_data> addr_data_opt;
+        connection_metadata meta;
+        std::vector<char> prefix;
+        bool has_shard_selection = false;
+        unsigned target_shard = 0;
+
+        // Read first byte to detect protocol layer
+        char first_byte;
+        auto n = co_await fd.read_some(&first_byte, 1);
+        if (n < 1) {
+            continue; // EOF, drop
+        }
+
+        // 1. Proxy Protocol v2 auto-detection (first byte 0x0D)
+        if (first_byte == 0x0D) {
+            // Might be PP v2. Read remaining 15 bytes of the 16-byte header.
+            char header_rest[15];
+            auto nr = co_await fd.read_some(header_rest, 15);
+            if (nr < 15) {
+                continue; // incomplete, drop
+            }
+
+            char full_header[16];
+            full_header[0] = first_byte;
+            std::memcpy(full_header + 1, header_rest, 15);
+
+            static const char pp2_signature[12] = {
+                0x0d, 0x0a, 0x0d, 0x0a, 0x00, 0x0d, 0x0a, 0x51, 0x55, 0x49, 0x54, 0x0a
+            };
+            if (std::memcmp(full_header, pp2_signature, sizeof(pp2_signature)) != 0) {
+                continue; // invalid PP signature, drop
+            }
+
+            auto len = read_be<uint16_t>(full_header + 14);
+
+            char stack_buffer[36];
+            std::unique_ptr<char[]> heap_buffer;
+            auto* buffer = stack_buffer;
+            if (len > sizeof(stack_buffer)) {
+                heap_buffer = std::make_unique<char[]>(len);
+                buffer = heap_buffer.get();
+            }
+
+            auto xlen = co_await fd.read_some(buffer, len);
+            if (xlen < len) {
+                continue; // incomplete, drop
+            }
+
+            // Parse PP v2 addresses (same logic as read_proxy_data)
+            uint8_t fam_proto = full_header[13];
+            switch (full_header[12]) {
+            case 0x20: // LOCAL
+                if (fam_proto != 0x00) continue;
+                addr_data_opt = local_proxy_data(fd);
+                break;
+            case 0x21: { // PROXY
+                auto fam = fam_proto >> 4;
+                auto proto = fam_proto & 0x0F;
+                if (proto != 0x1) continue; // STREAM only
+                proxy_data pd;
+                switch (fam) {
+                case 0x1: // INET
+                    if (len < 12) continue;
+                    pd.remote_address = ipv4_addr(inet_address(copy_reinterpret_cast<in_addr>(buffer)), read_be<uint16_t>(buffer + 8));
+                    pd.local_address = ipv4_addr(inet_address(copy_reinterpret_cast<in_addr>(buffer + 4)), read_be<uint16_t>(buffer + 10));
+                    break;
+                case 0x2: // INET6
+                    if (len < 36) continue;
+                    pd.remote_address = ipv6_addr(inet_address(copy_reinterpret_cast<in6_addr>(buffer)), read_be<uint16_t>(buffer + 32));
+                    pd.local_address = ipv6_addr(inet_address(copy_reinterpret_cast<in6_addr>(buffer + 16)), read_be<uint16_t>(buffer + 34));
+                    break;
+                default:
+                    continue;
+                }
+                addr_data_opt = std::move(pd);
+                break;
+            }
+            default:
+                continue;
+            }
+            sa = addr_data_opt->remote_address;
+
+            // Read next byte for further detection
+            n = co_await fd.read_some(&first_byte, 1);
+            if (n < 1) continue;
+        }
+
+        // 2. Shard selection header auto-detection (magic 0xAA)
+        if (first_byte == master_port_shard_select_magic) {
+            char hdr[3]; // remaining 3 bytes of 4-byte header
+            auto nr = co_await fd.read_some(hdr, 3);
+            if (nr < 3) continue;
+
+            uint8_t flags = static_cast<uint8_t>(hdr[0]);
+            meta.is_tls = (flags & 0x01) != 0;
+            uint16_t shard_id = (static_cast<uint16_t>(static_cast<uint8_t>(hdr[1])) << 8)
+                              | static_cast<uint8_t>(hdr[2]);
+            target_shard = shard_id % smp::count;
+            has_shard_selection = true;
+            // All header bytes consumed, fd stream starts with TLS or CQL data
+        } else {
+            // 3. Legacy client: first_byte is TLS (0x16) or CQL version (0x03+)
+            meta.is_tls = (static_cast<uint8_t>(first_byte) == 0x16);
+            // Save consumed byte as prefix to prepend to the data stream
+            prefix.push_back(first_byte);
+        }
+
+        // Determine target shard
+        auto cth = has_shard_selection
+            ? _conntrack.get_handle(target_shard)
+            : _conntrack.get_handle(); // default LBA (connection_distribution)
+
+        auto cpu = cth.cpu();
+        if (cpu == this_shard_id()) {
+            auto csi = make_master_port_connected_socket_impl(
+                sa.family(), _protocol, std::move(fd), std::move(cth),
+                std::move(addr_data_opt), std::move(prefix), _allocator);
+            co_return accept_result{connected_socket(std::move(csi)), sa, meta};
+        } else {
+            (void)smp::submit_to(cpu, [protocol = _protocol, ssa = _sa,
+                    fd = std::move(fd.get_file_desc()), sa, cth = std::move(cth),
+                    addr_data_opt = std::move(addr_data_opt), allocator = _allocator,
+                    meta, prefix = std::move(prefix)] () mutable {
+                posix_ap_server_socket_impl::move_connected_socket(
+                    protocol, ssa, pollable_fd(std::move(fd)), sa, std::move(cth),
+                    std::move(addr_data_opt), allocator, meta, std::move(prefix));
+            });
+        }
+    }
+}
+
 future<accept_result>
 posix_server_socket_impl::accept() {
+    if (_master_port) {
+        co_return co_await accept_master_port();
+    }
     while (true) { // exited via co_return
         auto [fd, sa] = co_await _lfd.accept();
 
@@ -778,9 +987,19 @@ future<accept_result> posix_ap_server_socket_impl::accept() {
         connection c = std::move(conni->second);
         conn_q.erase(conni);
         try {
-            std::unique_ptr<connected_socket_impl> csi(
-                    new posix_connected_socket_impl(_sa.family(), _protocol, std::move(c.fd), std::move(c.connection_tracking_handle), _allocator));
-            return make_ready_future<accept_result>(accept_result{connected_socket(std::move(csi)), std::move(c.addr)});
+            std::unique_ptr<connected_socket_impl> csi;
+            if (!c.prefix.empty()) {
+                csi = make_master_port_connected_socket_impl(
+                    _sa.family(), _protocol, std::move(c.fd),
+                    std::move(c.connection_tracking_handle),
+                    std::move(c.proxy_protocol_header_opt),
+                    std::move(c.prefix), _allocator);
+            } else {
+                csi = std::make_unique<posix_connected_socket_impl>(
+                    _sa.family(), _protocol, std::move(c.fd),
+                    std::move(c.connection_tracking_handle), _allocator);
+            }
+            return make_ready_future<accept_result>(accept_result{connected_socket(std::move(csi)), std::move(c.addr), c.metadata});
         } catch (...) {
             return make_exception_future<accept_result>(std::current_exception());
         }
@@ -826,25 +1045,28 @@ socket_address posix_reuseport_server_socket_impl::local_address() const {
 }
 
 void
-posix_ap_server_socket_impl::move_connected_socket(int protocol, socket_address sa, pollable_fd fd, socket_address addr, conntrack::handle cth, std::optional<proxy_data> addr_data_opt, std::pmr::polymorphic_allocator<char>* allocator) {
+posix_ap_server_socket_impl::move_connected_socket(int protocol, socket_address sa, pollable_fd fd, socket_address addr, conntrack::handle cth, std::optional<proxy_data> addr_data_opt, std::pmr::polymorphic_allocator<char>* allocator, connection_metadata meta, std::vector<char> prefix) {
     auto t_sa = std::make_tuple(protocol, sa);
     auto i = sockets.find(t_sa);
     if (i != sockets.end()) {
         try {
-            auto csi = make_maybe_proxied_connected_socket_impl(
-                sa.family(),
-                protocol,
-                std::move(fd),
-                std::move(cth),
-                std::move(addr_data_opt),
-                allocator);
-            i->second.set_value(accept_result{connected_socket(std::move(csi)), std::move(addr)});
+            std::unique_ptr<connected_socket_impl> csi;
+            if (!prefix.empty()) {
+                csi = make_master_port_connected_socket_impl(
+                    sa.family(), protocol, std::move(fd), std::move(cth),
+                    std::move(addr_data_opt), std::move(prefix), allocator);
+            } else {
+                csi = make_maybe_proxied_connected_socket_impl(
+                    sa.family(), protocol, std::move(fd), std::move(cth),
+                    std::move(addr_data_opt), allocator);
+            }
+            i->second.set_value(accept_result{connected_socket(std::move(csi)), std::move(addr), meta});
         } catch (...) {
             i->second.set_exception(std::current_exception());
         }
         sockets.erase(i);
     } else {
-        conn_q.emplace(std::piecewise_construct, std::make_tuple(t_sa), std::make_tuple(std::move(fd), std::move(addr), std::move(cth), std::move(addr_data_opt)));
+        conn_q.emplace(std::piecewise_construct, std::make_tuple(t_sa), std::make_tuple(std::move(fd), std::move(addr), std::move(cth), std::move(addr_data_opt), meta, std::move(prefix)));
     }
 }
 
@@ -921,13 +1143,13 @@ posix_network_stack::listen(socket_address sa, listen_options opt) {
         sa = inet_address(inet_address::family::INET);
     }
     if (sa.is_af_unix()) {
-        return server_socket(std::make_unique<posix_server_socket_impl>(0, sa, internal::posix_listen(sa, opt), opt.lba, opt.fixed_cpu, opt.proxy_protocol, _allocator));
+        return server_socket(std::make_unique<posix_server_socket_impl>(0, sa, internal::posix_listen(sa, opt), opt.lba, opt.fixed_cpu, opt.proxy_protocol, opt.master_port, _allocator));
     }
     auto protocol = static_cast<int>(opt.proto);
     return _reuseport ?
         server_socket(std::make_unique<posix_reuseport_server_socket_impl>(protocol, sa, internal::posix_listen(sa, opt), _allocator))
         :
-        server_socket(std::make_unique<posix_server_socket_impl>(protocol, sa, internal::posix_listen(sa, opt), opt.lba, opt.fixed_cpu, opt.proxy_protocol, _allocator));
+        server_socket(std::make_unique<posix_server_socket_impl>(protocol, sa, internal::posix_listen(sa, opt), opt.lba, opt.fixed_cpu, opt.proxy_protocol, opt.master_port, _allocator));
 }
 
 ::seastar::socket posix_network_stack::socket() {
