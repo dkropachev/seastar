@@ -173,8 +173,8 @@ class posix_ap_server_socket_impl : public server_socket_impl {
         conntrack::handle connection_tracking_handle;
         std::optional<proxy_data> proxy_protocol_header_opt;
         connection_metadata metadata;
-        std::vector<char> prefix;
-        connection(pollable_fd xfd, socket_address xaddr, conntrack::handle cth, std::optional<proxy_data> addr_data_opt, connection_metadata meta = {}, std::vector<char> pfx = {}) : fd(std::move(xfd)), addr(xaddr), connection_tracking_handle(std::move(cth)), proxy_protocol_header_opt(std::move(addr_data_opt)), metadata(meta), prefix(std::move(pfx)) {}
+        std::optional<char> prefix;
+        connection(pollable_fd xfd, socket_address xaddr, conntrack::handle cth, std::optional<proxy_data> addr_data_opt, connection_metadata meta = {}, std::optional<char> pfx = {}) : fd(std::move(xfd)), addr(xaddr), connection_tracking_handle(std::move(cth)), proxy_protocol_header_opt(std::move(addr_data_opt)), metadata(meta), prefix(pfx) {}
     };
     using port_map_t = std::unordered_set<protocol_and_socket_address>;
     using sockets_map_t = std::unordered_map<protocol_and_socket_address, promise<accept_result>>;
@@ -193,7 +193,7 @@ public:
     socket_address local_address() const override {
         return _sa;
     }
-    static void move_connected_socket(int protocol, socket_address sa, pollable_fd fd, socket_address addr, conntrack::handle handle, std::optional<proxy_data> addr_data_opt, std::pmr::polymorphic_allocator<char>* allocator, connection_metadata meta = {}, std::vector<char> prefix = {});
+    static void move_connected_socket(int protocol, socket_address sa, pollable_fd fd, socket_address addr, conntrack::handle handle, std::optional<proxy_data> addr_data_opt, std::pmr::polymorphic_allocator<char>* allocator, connection_metadata meta = {}, std::optional<char> prefix = {});
 
     template <typename T>
     friend class std::hash;

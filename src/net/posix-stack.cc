@@ -593,19 +593,88 @@ local_proxy_data(const pollable_fd& pfd) {
     return header;
 }
 
+// Read exactly `len` bytes from fd into buf, looping on partial reads.
+// Returns false on EOF before all bytes are read.
+static
+future<bool>
+read_exactly(pollable_fd& fd, char* buf, size_t len) {
+    size_t total = 0;
+    while (total < len) {
+        auto n = co_await fd.read_some(buf + total, len - total);
+        if (n == 0) {
+            co_return false;
+        }
+        total += n;
+    }
+    co_return true;
+}
+
+static const char pp2_signature[12] = {
+    0x0d, 0x0a, 0x0d, 0x0a, 0x00, 0x0d, 0x0a, 0x51, 0x55, 0x49, 0x54, 0x0a
+};
+
+// Parse PP v2 version/command, family/protocol, and addresses from a 16-byte
+// header and an address payload buffer.  Returns nullopt on invalid data.
+static
+std::optional<proxy_data>
+parse_pp2_addresses(const char* header, const char* addr_buf, uint16_t addr_len,
+                    const pollable_fd& fd) {
+    uint8_t fam_proto = header[13];
+    switch (header[12]) { // version and command
+    case 0x20: // v2, LOCAL
+        if (fam_proto != 0x00) { // UNSPEC
+            return std::nullopt;
+        }
+        return local_proxy_data(fd);
+    case 0x21: // v2, PROXY
+        break;
+    default:
+        return std::nullopt;
+    }
+
+    auto fam = fam_proto >> 4;
+    auto proto = fam_proto & 0x0F;
+
+    // We could, in principle, support DGRAM here, but there's no
+    // real need for it. Real-world proxies support proxying UDP as UDP.
+    if (proto != 0x1) { // STREAM
+        return std::nullopt;
+    }
+
+    proxy_data addr_data;
+
+    switch (fam) {
+    case 0x1: { // INET
+        if (addr_len < 12) {
+            return std::nullopt;
+        }
+        addr_data.remote_address = ipv4_addr(inet_address(copy_reinterpret_cast<in_addr>(addr_buf)), read_be<uint16_t>(addr_buf + 8));
+        addr_data.local_address = ipv4_addr(inet_address(copy_reinterpret_cast<in_addr>(addr_buf + 4)), read_be<uint16_t>(addr_buf + 10));
+        break;
+    }
+    case 0x2: { // INET6
+        if (addr_len < 36) {
+            return std::nullopt;
+        }
+        addr_data.remote_address = ipv6_addr(inet_address(copy_reinterpret_cast<in6_addr>(addr_buf)), read_be<uint16_t>(addr_buf + 32));
+        addr_data.local_address = ipv6_addr(inet_address(copy_reinterpret_cast<in6_addr>(addr_buf + 16)), read_be<uint16_t>(addr_buf + 34));
+        break;
+    }
+    default:
+        return std::nullopt;
+    }
+    return addr_data;
+}
+
 // Parses proxy protocol v2 header; returns std::nullopt if no valid header is found.
 static
 future<std::optional<proxy_data>>
 read_proxy_data(pollable_fd& fd) {
     constexpr size_t pp2_header_len = 16;
     char header_buf[pp2_header_len];
-    auto n_read = co_await fd.read_some(header_buf, pp2_header_len);
-    if (n_read < pp2_header_len) {
+    if (!co_await read_exactly(fd, header_buf, pp2_header_len)) {
         co_return std::nullopt;
     }
-    static const char pp2_signature[12] = {
-        0x0d, 0x0a, 0x0d, 0x0a, 0x00, 0x0d, 0x0a, 0x51, 0x55, 0x49, 0x54, 0x0a
-    };
     if (std::memcmp(header_buf, pp2_signature, sizeof(pp2_signature)) != 0) {
         co_return std::nullopt;
     }
@@ -621,57 +690,11 @@ read_proxy_data(pollable_fd& fd) {
         buffer = heap_buffer.get();
     }
 
-    auto xlen = co_await fd.read_some(buffer, len);
-    if (xlen < len) {
+    if (!co_await read_exactly(fd, buffer, len)) {
         co_return std::nullopt;
     }
 
-    uint8_t fam_proto = header_buf[13];
-    switch (header_buf[12]) { // version and command
-    case 0x20: // v2, LOCAL
-        if (fam_proto != 0x00) { // UNSPEC
-            co_return std::nullopt;
-        }
-        co_return local_proxy_data(fd);
-    case 0x21: // v2, PROXY
-        // Mainline continues after the switch
-        break;
-    default:   // Not defined, must reject
-        co_return std::nullopt;
-    }
-
-    auto fam = fam_proto >> 4;
-    auto proto = fam_proto & 0x0F;
-
-    // We could, in principle, support DGRAM here, but there's no
-    // real need for it. Real-world proxies support proxying UDP as UDP.
-    if (proto != 0x1) { // STREAM
-        co_return std::nullopt;
-    }
-
-    proxy_data addr_data;
-
-    switch (fam) {
-    case 0x1: { // INET
-        if (len < 12) {
-            co_return std::nullopt;
-        }
-        addr_data.remote_address = ipv4_addr(inet_address(copy_reinterpret_cast<in_addr>(buffer)), read_be<uint16_t>(buffer + 8));
-        addr_data.local_address = ipv4_addr(inet_address(copy_reinterpret_cast<in_addr>(buffer + 4)), read_be<uint16_t>(buffer + 10));
-        break;
-    }
-    case 0x2: { // INET6
-        if (len < 36) {
-            co_return std::nullopt;
-        }
-        addr_data.remote_address = ipv6_addr(inet_address(copy_reinterpret_cast<in6_addr>(buffer)), read_be<uint16_t>(buffer + 32));
-        addr_data.local_address = ipv6_addr(inet_address(copy_reinterpret_cast<in6_addr>(buffer + 16)), read_be<uint16_t>(buffer + 34));
-        break;
-    }
-    default:
-        co_return std::nullopt;
-    }
-    co_return addr_data;
+    co_return parse_pp2_addresses(header_buf, buffer, len, fd);
 }
 
 // Data source that yields prefix bytes before delegating to the underlying source.
@@ -693,29 +716,29 @@ public:
     }
 };
 
-// Connected socket that prepends prefix bytes to the data stream.
+// Connected socket that prepends a single prefix byte to the data stream.
 // Used by master port for legacy clients where the first byte was consumed during detection.
 class prefixed_posix_connected_socket_impl final : public posix_connected_socket_impl {
-    std::vector<char> _prefix;
+    std::optional<char> _prefix;
 public:
     prefixed_posix_connected_socket_impl(
             sa_family_t family, int protocol, pollable_fd fd,
             conntrack::handle&& handle,
-            std::vector<char> prefix,
+            std::optional<char> prefix,
             std::pmr::polymorphic_allocator<char>* allocator = memory::malloc_allocator)
         : posix_connected_socket_impl(family, protocol, std::move(fd), std::move(handle), allocator)
-        , _prefix(std::move(prefix)) {}
+        , _prefix(prefix) {}
     data_source source() override {
         return source(connected_socket_input_stream_config());
     }
     data_source source(connected_socket_input_stream_config csisc) override {
         auto underlying = posix_connected_socket_impl::source(csisc);
-        if (_prefix.empty()) {
+        if (!_prefix) {
             return underlying;
         }
-        temporary_buffer<char> pfx(_prefix.size());
-        std::copy(_prefix.begin(), _prefix.end(), pfx.get_write());
-        _prefix.clear();
+        temporary_buffer<char> pfx(1);
+        *pfx.get_write() = *_prefix;
+        _prefix.reset();
         return data_source(std::make_unique<prefixed_data_source_impl>(
             std::move(pfx), std::move(underlying)));
     }
@@ -760,12 +783,12 @@ make_master_port_connected_socket_impl(
         pollable_fd fd,
         conntrack::handle&& handle,
         std::optional<proxy_data> addr_data_opt,
-        std::vector<char> prefix,
+        std::optional<char> prefix,
         std::pmr::polymorphic_allocator<char>* allocator = memory::malloc_allocator) {
-    if (!prefix.empty()) {
+    if (prefix) {
         return std::make_unique<prefixed_posix_connected_socket_impl>(
             family, protocol, std::move(fd), std::move(handle),
-            std::move(prefix), allocator);
+            prefix, allocator);
     }
     return make_maybe_proxied_connected_socket_impl(
         family, protocol, std::move(fd), std::move(handle),
@@ -779,35 +802,33 @@ posix_server_socket_impl::accept_master_port() {
 
         std::optional<proxy_data> addr_data_opt;
         connection_metadata meta;
-        std::vector<char> prefix;
+        std::optional<char> prefix;
         bool has_shard_selection = false;
         unsigned target_shard = 0;
 
         // Read first byte to detect protocol layer
         char first_byte;
-        auto n = co_await fd.read_some(&first_byte, 1);
-        if (n < 1) {
-            continue; // EOF, drop
+        if (!co_await read_exactly(fd, &first_byte, 1)) {
+            seastar_logger.debug("master port: EOF on first byte, dropping connection");
+            continue;
         }
 
         // 1. Proxy Protocol v2 auto-detection (first byte 0x0D)
         if (first_byte == 0x0D) {
             // Might be PP v2. Read remaining 15 bytes of the 16-byte header.
             char header_rest[15];
-            auto nr = co_await fd.read_some(header_rest, 15);
-            if (nr < 15) {
-                continue; // incomplete, drop
+            if (!co_await read_exactly(fd, header_rest, 15)) {
+                seastar_logger.debug("master port: incomplete PP v2 header, dropping connection");
+                continue;
             }
 
             char full_header[16];
             full_header[0] = first_byte;
             std::memcpy(full_header + 1, header_rest, 15);
 
-            static const char pp2_signature[12] = {
-                0x0d, 0x0a, 0x0d, 0x0a, 0x00, 0x0d, 0x0a, 0x51, 0x55, 0x49, 0x54, 0x0a
-            };
             if (std::memcmp(full_header, pp2_signature, sizeof(pp2_signature)) != 0) {
-                continue; // invalid PP signature, drop
+                seastar_logger.debug("master port: invalid PP v2 signature, dropping connection");
+                continue;
             }
 
             auto len = read_be<uint16_t>(full_header + 14);
@@ -820,55 +841,32 @@ posix_server_socket_impl::accept_master_port() {
                 buffer = heap_buffer.get();
             }
 
-            auto xlen = co_await fd.read_some(buffer, len);
-            if (xlen < len) {
-                continue; // incomplete, drop
+            if (!co_await read_exactly(fd, buffer, len)) {
+                seastar_logger.debug("master port: incomplete PP v2 address data, dropping connection");
+                continue;
             }
 
-            // Parse PP v2 addresses (same logic as read_proxy_data)
-            uint8_t fam_proto = full_header[13];
-            switch (full_header[12]) {
-            case 0x20: // LOCAL
-                if (fam_proto != 0x00) continue;
-                addr_data_opt = local_proxy_data(fd);
-                break;
-            case 0x21: { // PROXY
-                auto fam = fam_proto >> 4;
-                auto proto = fam_proto & 0x0F;
-                if (proto != 0x1) continue; // STREAM only
-                proxy_data pd;
-                switch (fam) {
-                case 0x1: // INET
-                    if (len < 12) continue;
-                    pd.remote_address = ipv4_addr(inet_address(copy_reinterpret_cast<in_addr>(buffer)), read_be<uint16_t>(buffer + 8));
-                    pd.local_address = ipv4_addr(inet_address(copy_reinterpret_cast<in_addr>(buffer + 4)), read_be<uint16_t>(buffer + 10));
-                    break;
-                case 0x2: // INET6
-                    if (len < 36) continue;
-                    pd.remote_address = ipv6_addr(inet_address(copy_reinterpret_cast<in6_addr>(buffer)), read_be<uint16_t>(buffer + 32));
-                    pd.local_address = ipv6_addr(inet_address(copy_reinterpret_cast<in6_addr>(buffer + 16)), read_be<uint16_t>(buffer + 34));
-                    break;
-                default:
-                    continue;
-                }
-                addr_data_opt = std::move(pd);
-                break;
-            }
-            default:
+            addr_data_opt = parse_pp2_addresses(full_header, buffer, len, fd);
+            if (!addr_data_opt) {
+                seastar_logger.debug("master port: unsupported PP v2 address family or protocol, dropping connection");
                 continue;
             }
             sa = addr_data_opt->remote_address;
 
             // Read next byte for further detection
-            n = co_await fd.read_some(&first_byte, 1);
-            if (n < 1) continue;
+            if (!co_await read_exactly(fd, &first_byte, 1)) {
+                seastar_logger.debug("master port: EOF after PP v2 header, dropping connection");
+                continue;
+            }
         }
 
         // 2. Shard selection header auto-detection (magic 0xAA)
         if (first_byte == master_port_shard_select_magic) {
             char hdr[3]; // remaining 3 bytes of 4-byte header
-            auto nr = co_await fd.read_some(hdr, 3);
-            if (nr < 3) continue;
+            if (!co_await read_exactly(fd, hdr, 3)) {
+                seastar_logger.debug("master port: incomplete shard selection header, dropping connection");
+                continue;
+            }
 
             uint8_t flags = static_cast<uint8_t>(hdr[0]);
             meta.is_tls = (flags & 0x01) != 0;
@@ -881,7 +879,7 @@ posix_server_socket_impl::accept_master_port() {
             // 3. Legacy client: first_byte is TLS (0x16) or CQL version (0x03+)
             meta.is_tls = (static_cast<uint8_t>(first_byte) == 0x16);
             // Save consumed byte as prefix to prepend to the data stream
-            prefix.push_back(first_byte);
+            prefix = first_byte;
         }
 
         // Determine target shard
@@ -893,16 +891,16 @@ posix_server_socket_impl::accept_master_port() {
         if (cpu == this_shard_id()) {
             auto csi = make_master_port_connected_socket_impl(
                 sa.family(), _protocol, std::move(fd), std::move(cth),
-                std::move(addr_data_opt), std::move(prefix), _allocator);
+                std::move(addr_data_opt), prefix, _allocator);
             co_return accept_result{connected_socket(std::move(csi)), sa, meta};
         } else {
             (void)smp::submit_to(cpu, [protocol = _protocol, ssa = _sa,
                     fd = std::move(fd.get_file_desc()), sa, cth = std::move(cth),
                     addr_data_opt = std::move(addr_data_opt), allocator = _allocator,
-                    meta, prefix = std::move(prefix)] () mutable {
+                    meta, prefix] () mutable {
                 posix_ap_server_socket_impl::move_connected_socket(
                     protocol, ssa, pollable_fd(std::move(fd)), sa, std::move(cth),
-                    std::move(addr_data_opt), allocator, meta, std::move(prefix));
+                    std::move(addr_data_opt), allocator, meta, prefix);
             });
         }
     }
@@ -988,12 +986,12 @@ future<accept_result> posix_ap_server_socket_impl::accept() {
         conn_q.erase(conni);
         try {
             std::unique_ptr<connected_socket_impl> csi;
-            if (!c.prefix.empty()) {
+            if (c.prefix) {
                 csi = make_master_port_connected_socket_impl(
                     _sa.family(), _protocol, std::move(c.fd),
                     std::move(c.connection_tracking_handle),
                     std::move(c.proxy_protocol_header_opt),
-                    std::move(c.prefix), _allocator);
+                    c.prefix, _allocator);
             } else {
                 csi = std::make_unique<posix_connected_socket_impl>(
                     _sa.family(), _protocol, std::move(c.fd),
@@ -1045,16 +1043,16 @@ socket_address posix_reuseport_server_socket_impl::local_address() const {
 }
 
 void
-posix_ap_server_socket_impl::move_connected_socket(int protocol, socket_address sa, pollable_fd fd, socket_address addr, conntrack::handle cth, std::optional<proxy_data> addr_data_opt, std::pmr::polymorphic_allocator<char>* allocator, connection_metadata meta, std::vector<char> prefix) {
+posix_ap_server_socket_impl::move_connected_socket(int protocol, socket_address sa, pollable_fd fd, socket_address addr, conntrack::handle cth, std::optional<proxy_data> addr_data_opt, std::pmr::polymorphic_allocator<char>* allocator, connection_metadata meta, std::optional<char> prefix) {
     auto t_sa = std::make_tuple(protocol, sa);
     auto i = sockets.find(t_sa);
     if (i != sockets.end()) {
         try {
             std::unique_ptr<connected_socket_impl> csi;
-            if (!prefix.empty()) {
+            if (prefix) {
                 csi = make_master_port_connected_socket_impl(
                     sa.family(), protocol, std::move(fd), std::move(cth),
-                    std::move(addr_data_opt), std::move(prefix), allocator);
+                    std::move(addr_data_opt), prefix, allocator);
             } else {
                 csi = make_maybe_proxied_connected_socket_impl(
                     sa.family(), protocol, std::move(fd), std::move(cth),
@@ -1066,7 +1064,7 @@ posix_ap_server_socket_impl::move_connected_socket(int protocol, socket_address 
         }
         sockets.erase(i);
     } else {
-        conn_q.emplace(std::piecewise_construct, std::make_tuple(t_sa), std::make_tuple(std::move(fd), std::move(addr), std::move(cth), std::move(addr_data_opt), meta, std::move(prefix)));
+        conn_q.emplace(std::piecewise_construct, std::make_tuple(t_sa), std::make_tuple(std::move(fd), std::move(addr), std::move(cth), std::move(addr_data_opt), meta, prefix));
     }
 }
 
