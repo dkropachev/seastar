@@ -38,6 +38,8 @@
 #include <seastar/core/sleep.hh>
 #include <seastar/core/thread.hh>
 #include <seastar/core/when_all.hh>
+#include <seastar/core/timer.hh>
+#include <seastar/core/with_timeout.hh>
 #include <seastar/net/api.hh>
 #include <seastar/net/posix-stack.hh>
 #include <stdexcept>
@@ -46,6 +48,7 @@
 #include <optional>
 #include <tuple>
 #include <future>
+#include <sys/resource.h>
 
 using namespace seastar;
 
@@ -453,9 +456,9 @@ test_load_balancing_algorithm_port(socket_address listen_addr, bool proxy_protoc
         future<> run() {
             try {
                 while (true) {
-                    auto [cs, _] = co_await ss.accept();
-                    auto out = cs.output();
-                    auto in = cs.input();
+                    auto accepted = co_await ss.accept();
+                    auto out = accepted.connection.output();
+                    auto in = accepted.connection.input();
                     unsigned shard_id = this_shard_id();
                     char buf[4];
                     write_be<unsigned>(buf, shard_id);
@@ -578,6 +581,147 @@ test_load_balancing_algorithm_port(socket_address listen_addr, bool proxy_protoc
     BOOST_REQUIRE_EQUAL(results.bad_proxy_send, 0);
     BOOST_REQUIRE_EQUAL(results.bad_recv, 0);
     BOOST_REQUIRE_EQUAL(results.bad_shard, 0);
+}
+
+namespace {
+
+class scoped_fd_exhaustion {
+    rlimit _original;
+    std::vector<file_desc> _holders;
+    bool _active = false;
+public:
+    int exhaustion_error = 0;
+    int restore_error = 0;
+
+    scoped_fd_exhaustion() {
+        constexpr rlim_t max_fds = 256;
+        _holders.reserve(max_fds);
+        throw_system_error_on(::getrlimit(RLIMIT_NOFILE, &_original) == -1, "getrlimit");
+        auto limit = _original;
+        limit.rlim_cur = std::min(limit.rlim_cur, max_fds);
+        throw_system_error_on(::setrlimit(RLIMIT_NOFILE, &limit) == -1, "setrlimit");
+        _active = true;
+        while (true) {
+            int fd = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
+            if (fd == -1) {
+                exhaustion_error = errno;
+                break;
+            }
+            _holders.emplace_back(file_desc::from_fd(fd));
+        }
+    }
+
+    void restore() noexcept {
+        if (_active) {
+            if (::setrlimit(RLIMIT_NOFILE, &_original) == -1) {
+                restore_error = errno;
+            } else {
+                _active = false;
+            }
+        }
+        _holders.clear();
+    }
+
+    ~scoped_fd_exhaustion() {
+        restore();
+    }
+};
+
+struct unified_accept_setup {
+    seastar::socket connector = engine().net().socket();
+    std::optional<connected_socket> client;
+    pollable_fd listener;
+
+    explicit unified_accept_setup(pollable_fd fd) : listener(std::move(fd)) {}
+
+    static future<> prepare(lw_shared_ptr<unified_accept_setup> self, socket_address address) {
+        self->client.emplace(co_await self->connector.connect(address));
+        auto output = self->client->output();
+        co_await output.write("\x04", 1);
+        co_await output.close();
+        // Observe a queued local connection before exhausting this process's fds.
+        co_await self->listener.readable();
+    }
+
+    void cancel() noexcept {
+        try {
+            connector.shutdown();
+        } catch (...) {
+        }
+        try {
+            listener.shutdown(SHUT_RD, pollable_fd::shutdown_kernel_only::no);
+        } catch (...) {
+        }
+    }
+};
+
+} // anonymous namespace
+
+SEASTAR_THREAD_TEST_CASE(test_unified_port_accept_recovers_after_emfile) {
+    listen_options lo;
+    lo.unified_port.emplace();
+    auto fd = internal::posix_listen(ipv4_addr("127.0.0.1", 0), lo);
+    auto address = fd.get_file_desc().get_address();
+    server_socket listener(std::make_unique<net::posix_server_socket_impl>(
+            IPPROTO_TCP, address, fd, lo.lba, lo.fixed_cpu, false, lo.unified_port));
+    auto stop_listener = defer([&listener] () noexcept { listener.abort_accept(); });
+    auto setup = make_lw_shared<unified_accept_setup>(fd);
+    try {
+        with_timeout(timer<>::clock::now() + std::chrono::seconds(2),
+                unified_accept_setup::prepare(setup, address)).get();
+    } catch (...) {
+        // The coroutine owns all pending I/O state even if cancellation is late.
+        setup->cancel();
+        throw;
+    }
+    auto client = std::move(*setup->client);
+    fd.speculate_epoll(EPOLLIN);
+    scoped_fd_exhaustion exhausted;
+    bool timed_out = false;
+    timer<> deadline([&] {
+        exhausted.restore();
+        timed_out = true;
+        listener.abort_accept();
+    });
+    deadline.arm(timer<>::clock::now() + std::chrono::seconds(2));
+    auto first = listener.accept().then_wrapped([&exhausted] (future<accept_result> result) {
+        exhausted.restore();
+        return result;
+    });
+    std::exception_ptr accept_error;
+    try {
+        first.get();
+    } catch (...) {
+        accept_error = std::current_exception();
+    }
+    deadline.cancel();
+    exhausted.restore();
+
+    // Restore the limit and release every holder before assertions or reporting.
+    BOOST_REQUIRE_EQUAL(exhausted.restore_error, 0);
+    BOOST_REQUIRE_EQUAL(exhausted.exhaustion_error, EMFILE);
+    BOOST_REQUIRE(!timed_out);
+    BOOST_REQUIRE(accept_error);
+    BOOST_REQUIRE_EXCEPTION(std::rethrow_exception(accept_error), std::system_error,
+            [] (const std::system_error& ex) { return ex.code().value() == EMFILE; });
+
+    // A transient accept failure must not stop the listener or discard its peer.
+    // More errors can queue before the first completion restores the fd limit.
+    deadline.arm(timer<>::clock::now() + std::chrono::seconds(2));
+    std::optional<accept_result> accepted;
+    for (unsigned attempt = 0; attempt < 256 && !accepted; ++attempt) {
+        try {
+            accepted.emplace(listener.accept().get());
+        } catch (const std::system_error& ex) {
+            if (ex.code().value() != EMFILE) {
+                throw;
+            }
+        }
+    }
+    deadline.cancel();
+    BOOST_REQUIRE(!timed_out);
+    BOOST_REQUIRE(accepted);
+    BOOST_REQUIRE_EQUAL(accepted->remote_address, client.local_address());
 }
 
 SEASTAR_THREAD_TEST_CASE(load_balancing_algorithm_port_ipv4_test) {

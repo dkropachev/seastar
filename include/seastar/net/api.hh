@@ -22,6 +22,7 @@
 #pragma once
 
 #include <chrono>
+#include <functional>
 #include <memory>
 #include <vector>
 #include <sys/types.h>
@@ -334,10 +335,17 @@ public:
 /// \addtogroup networking-module
 /// @{
 
+/// Metadata about an accepted connection, populated by unified port protocol detection.
+struct connection_metadata {
+    bool is_tls = false;  ///< Whether TLS follows (detected by unified port logic)
+    std::optional<socket_address> physical_peer; ///< TCP peer before PROXY address replacement
+};
+
 /// The result of an server_socket::accept() call
 struct accept_result {
     connected_socket connection;  ///< The newly-accepted connection
     socket_address remote_address;  ///< The address of the peer that connected to us
+    connection_metadata metadata;  ///< Additional metadata from protocol detection
 };
 
 /// A listening socket, waiting to accept incoming network connections.
@@ -407,6 +415,18 @@ public:
 
 /// @}
 
+/// Protocol and routing policy for a unified listener.
+struct unified_port_options {
+    enum class encryption_mode { plain_only, tls_only, both };
+    enum class proxy_protocol_mode { disabled, optional, required };
+
+    encryption_mode encryption = encryption_mode::both;
+    proxy_protocol_mode proxy_protocol = proxy_protocol_mode::disabled;
+    bool source_port_routing = false;
+    /// Only matching physical peers may supply PROXY protocol metadata.
+    std::function<bool(const net::inet_address&)> trusted_proxy;
+};
+
 /// Options for creating a listening socket.
 ///
 /// WARNING: these options currently only have an effect when using
@@ -447,6 +467,11 @@ struct listen_options {
     //
     // The proxy protocol is defined in https://www.haproxy.org/download/1.8/doc/proxy-protocol.txt
     bool proxy_protocol = false;
+
+    // Detect connection headers and enforce the specified transport, proxy, and
+    // routing policy. A shard header takes precedence over source-port routing.
+    // The legacy proxy_protocol and lba options do not apply to this listener.
+    std::optional<unified_port_options> unified_port;
 };
 
 class network_interface {

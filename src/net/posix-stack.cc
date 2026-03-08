@@ -24,6 +24,7 @@
 #include <chrono>
 #include <cstring>
 #include <functional>
+#include <list>
 #include <random>
 #include <variant>
 #include <coroutine>
@@ -40,6 +41,10 @@
 #include <seastar/util/assert.hh>
 
 #include <seastar/core/loop.hh>
+#include <seastar/core/gate.hh>
+#include <seastar/core/queue.hh>
+#include <seastar/core/semaphore.hh>
+#include <seastar/core/timer.hh>
 #include <seastar/core/reactor.hh>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/byteorder.hh>
@@ -49,6 +54,8 @@
 #include <seastar/net/api.hh>
 #include <seastar/net/inet_address.hh>
 #include <seastar/util/std-compat.hh>
+#include <seastar/util/defer.hh>
+#include <seastar/util/later.hh>
 
 namespace std {
 
@@ -585,19 +592,95 @@ local_proxy_data(const pollable_fd& pfd) {
     return header;
 }
 
+// Read exactly `len` bytes from fd into buf, looping on partial reads.
+// Returns false on EOF before all bytes are read.
+template <typename OnRead>
+static
+future<bool>
+read_exactly(pollable_fd& fd, char* buf, size_t len, OnRead on_read) {
+    size_t total = 0;
+    while (total < len) {
+        auto n = co_await fd.read_some(buf + total, len - total);
+        if (n == 0) {
+            co_return false;
+        }
+        total += n;
+        on_read(n);
+    }
+    co_return true;
+}
+
+static future<bool> read_exactly(pollable_fd& fd, char* buf, size_t len) {
+    return read_exactly(fd, buf, len, [] (size_t) {});
+}
+
+static const char pp2_signature[12] = {
+    0x0d, 0x0a, 0x0d, 0x0a, 0x00, 0x0d, 0x0a, 0x51, 0x55, 0x49, 0x54, 0x0a
+};
+
+// Parse PP v2 version/command, family/protocol, and addresses from a 16-byte
+// header and an address payload buffer.  Returns nullopt on invalid data.
+static
+std::optional<proxy_data>
+parse_pp2_addresses(const char* header, const char* addr_buf, uint16_t addr_len,
+                    const pollable_fd& fd) {
+    uint8_t fam_proto = header[13];
+    switch (header[12]) { // version and command
+    case 0x20: // v2, LOCAL
+        if (fam_proto != 0x00) { // UNSPEC
+            return std::nullopt;
+        }
+        return local_proxy_data(fd);
+    case 0x21: // v2, PROXY
+        break;
+    default:
+        return std::nullopt;
+    }
+
+    auto fam = fam_proto >> 4;
+    auto proto = fam_proto & 0x0F;
+
+    // We could, in principle, support DGRAM here, but there's no
+    // real need for it. Real-world proxies support proxying UDP as UDP.
+    if (proto != 0x1) { // STREAM
+        return std::nullopt;
+    }
+
+    proxy_data addr_data;
+
+    switch (fam) {
+    case 0x1: { // INET
+        if (addr_len < 12) {
+            return std::nullopt;
+        }
+        addr_data.remote_address = ipv4_addr(inet_address(copy_reinterpret_cast<in_addr>(addr_buf)), read_be<uint16_t>(addr_buf + 8));
+        addr_data.local_address = ipv4_addr(inet_address(copy_reinterpret_cast<in_addr>(addr_buf + 4)), read_be<uint16_t>(addr_buf + 10));
+        break;
+    }
+    case 0x2: { // INET6
+        if (addr_len < 36) {
+            return std::nullopt;
+        }
+        addr_data.remote_address = ipv6_addr(inet_address(copy_reinterpret_cast<in6_addr>(addr_buf)), read_be<uint16_t>(addr_buf + 32));
+        addr_data.local_address = ipv6_addr(inet_address(copy_reinterpret_cast<in6_addr>(addr_buf + 16)), read_be<uint16_t>(addr_buf + 34));
+        break;
+    }
+    default:
+        return std::nullopt;
+    }
+    return addr_data;
+}
+
 // Parses proxy protocol v2 header; returns std::nullopt if no valid header is found.
+template <typename OnRead>
 static
 future<std::optional<proxy_data>>
-read_proxy_data(pollable_fd& fd) {
+read_proxy_data(pollable_fd& fd, OnRead on_read) {
     constexpr size_t pp2_header_len = 16;
     char header_buf[pp2_header_len];
-    auto n_read = co_await fd.read_some(header_buf, pp2_header_len);
-    if (n_read < pp2_header_len) {
+    if (!co_await read_exactly(fd, header_buf, pp2_header_len, on_read)) {
         co_return std::nullopt;
     }
-    static const char pp2_signature[12] = {
-        0x0d, 0x0a, 0x0d, 0x0a, 0x00, 0x0d, 0x0a, 0x51, 0x55, 0x49, 0x54, 0x0a
-    };
     if (std::memcmp(header_buf, pp2_signature, sizeof(pp2_signature)) != 0) {
         co_return std::nullopt;
     }
@@ -613,58 +696,73 @@ read_proxy_data(pollable_fd& fd) {
         buffer = heap_buffer.get();
     }
 
-    auto xlen = co_await fd.read_some(buffer, len);
-    if (xlen < len) {
+    if (!co_await read_exactly(fd, buffer, len, on_read)) {
         co_return std::nullopt;
     }
 
-    uint8_t fam_proto = header_buf[13];
-    switch (header_buf[12]) { // version and command
-    case 0x20: // v2, LOCAL
-        if (fam_proto != 0x00) { // UNSPEC
-            co_return std::nullopt;
-        }
-        co_return local_proxy_data(fd);
-    case 0x21: // v2, PROXY
-        // Mainline continues after the switch
-        break;
-    default:   // Not defined, must reject
-        co_return std::nullopt;
-    }
-
-    auto fam = fam_proto >> 4;
-    auto proto = fam_proto & 0x0F;
-
-    // We could, in principle, support DGRAM here, but there's no
-    // real need for it. Real-world proxies support proxying UDP as UDP.
-    if (proto != 0x1) { // STREAM
-        co_return std::nullopt;
-    }
-
-    proxy_data addr_data;
-
-    switch (fam) {
-    case 0x1: { // INET
-        if (len < 12) {
-            co_return std::nullopt;
-        }
-        addr_data.remote_address = ipv4_addr(inet_address(copy_reinterpret_cast<in_addr>(buffer)), read_be<uint16_t>(buffer + 8));
-        addr_data.local_address = ipv4_addr(inet_address(copy_reinterpret_cast<in_addr>(buffer + 4)), read_be<uint16_t>(buffer + 10));
-        break;
-    }
-    case 0x2: { // INET6
-        if (len < 36) {
-            co_return std::nullopt;
-        }
-        addr_data.remote_address = ipv6_addr(inet_address(copy_reinterpret_cast<in6_addr>(buffer)), read_be<uint16_t>(buffer + 32));
-        addr_data.local_address = ipv6_addr(inet_address(copy_reinterpret_cast<in6_addr>(buffer + 16)), read_be<uint16_t>(buffer + 34));
-        break;
-    }
-    default:
-        co_return std::nullopt;
-    }
-    co_return addr_data;
+    co_return parse_pp2_addresses(header_buf, buffer, len, fd);
 }
+
+// Data source that yields prefix bytes before delegating to the underlying source.
+// Used by unified port to prepend bytes consumed during protocol detection.
+class prefixed_data_source_impl final : public data_source_impl {
+    lw_shared_ptr<std::optional<char>> _prefix;
+    data_source _underlying;
+public:
+    prefixed_data_source_impl(lw_shared_ptr<std::optional<char>> prefix, data_source underlying)
+        : _prefix(std::move(prefix)), _underlying(std::move(underlying)) {}
+    future<temporary_buffer<char>> get() override {
+        if (*_prefix) {
+            temporary_buffer<char> buffer(1);
+            *buffer.get_write() = **_prefix;
+            _prefix->reset();
+            return make_ready_future<temporary_buffer<char>>(std::move(buffer));
+        }
+        return _underlying.get();
+    }
+    future<> close() override {
+        return _underlying.close();
+    }
+};
+
+// Connected socket that prepends a single prefix byte to the data stream.
+// Used by unified port for legacy clients where the first byte was consumed during detection.
+class prefixed_posix_connected_socket_impl final : public posix_connected_socket_impl {
+    lw_shared_ptr<std::optional<char>> _prefix;
+    std::optional<proxy_data> _proxy;
+public:
+    prefixed_posix_connected_socket_impl(
+            sa_family_t family, int protocol, pollable_fd fd,
+            conntrack::handle&& handle,
+            std::optional<char> prefix,
+            std::optional<proxy_data> proxy,
+            std::pmr::polymorphic_allocator<char>* allocator = memory::malloc_allocator)
+        : posix_connected_socket_impl(family, protocol, std::move(fd), std::move(handle), allocator)
+        , _prefix(make_lw_shared<std::optional<char>>(prefix))
+        , _proxy(std::move(proxy)) {}
+    socket_address remote_address() const noexcept override {
+        return _proxy ? _proxy->remote_address : posix_connected_socket_impl::remote_address();
+    }
+    socket_address local_address() const noexcept override {
+        return _proxy ? _proxy->local_address : posix_connected_socket_impl::local_address();
+    }
+    data_source source() override {
+        return source(connected_socket_input_stream_config());
+    }
+    data_source source(connected_socket_input_stream_config csisc) override {
+        auto underlying = posix_connected_socket_impl::source(csisc);
+        if (!*_prefix) {
+            return underlying;
+        }
+        // Creating an unused input stream before TLS wrapping must not consume
+        // the saved byte. Whichever source reads first replays it exactly once.
+        return data_source(std::make_unique<prefixed_data_source_impl>(
+            _prefix, std::move(underlying)));
+    }
+};
+
+// Magic byte for the unified port shard selection header.
+static constexpr char unified_port_shard_select_magic = '\xAA';
 
 static
 std::unique_ptr<connected_socket_impl>
@@ -694,15 +792,344 @@ make_maybe_proxied_connected_socket_impl(
     }
 }
 
+static
+std::unique_ptr<connected_socket_impl>
+make_unified_port_connected_socket_impl(
+        sa_family_t family,
+        int protocol,
+        pollable_fd fd,
+        conntrack::handle&& handle,
+        std::optional<proxy_data> addr_data_opt,
+        std::optional<char> prefix,
+        std::pmr::polymorphic_allocator<char>* allocator = memory::malloc_allocator) {
+    if (prefix) {
+        return std::make_unique<prefixed_posix_connected_socket_impl>(
+            family, protocol, std::move(fd), std::move(handle),
+            prefix, std::move(addr_data_opt), allocator);
+    }
+    return make_maybe_proxied_connected_socket_impl(
+        family, protocol, std::move(fd), std::move(handle),
+        std::move(addr_data_opt), allocator);
+}
+
+// Limit both work awaiting preface bytes and sockets awaiting application accept.
+static constexpr size_t unified_port_max_pending = 128;
+static constexpr size_t unified_port_max_completed = 128;
+static constexpr auto unified_port_preface_timeout = std::chrono::seconds(5);
+
+struct posix_server_socket_impl::unified_port_state {
+    using completed_accept = std::variant<accept_result, std::exception_ptr>;
+
+    socket_address _sa;
+    int _protocol;
+    pollable_fd _lfd;
+    conntrack _conntrack;
+    std::optional<unified_port_options> _unified_port;
+    std::pmr::polymorphic_allocator<char>* _allocator;
+    semaphore _slots{unified_port_max_pending};
+    gate _detectors;
+    std::list<pollable_fd> _pending;
+    queue<completed_accept> _completed{unified_port_max_completed};
+    bool _stopped = false;
+
+    explicit unified_port_state(posix_server_socket_impl& listener)
+        : _sa(listener._sa), _protocol(listener._protocol), _lfd(listener._lfd)
+        , _conntrack(listener._conntrack), _unified_port(listener._unified_port)
+        , _allocator(listener._allocator) {
+    }
+
+    static void cancel(pollable_fd& fd) noexcept {
+        if (fd) {
+            try {
+                fd.shutdown(SHUT_RDWR, pollable_fd::shutdown_kernel_only::no);
+            } catch (...) {
+                // A disconnected peer needs no further cancellation.
+            }
+        }
+    }
+
+    void stop(std::exception_ptr ex = std::make_exception_ptr(std::system_error(ECONNABORTED, std::system_category()))) noexcept {
+        if (std::exchange(_stopped, true)) {
+            return;
+        }
+        _slots.broken(ex);
+        _completed.abort(ex);
+        try {
+            _lfd.shutdown(SHUT_RD, pollable_fd::shutdown_kernel_only::no);
+        } catch (...) {
+        }
+        for (auto& fd : _pending) {
+            cancel(fd);
+        }
+    }
+
+    future<> detect(std::list<pollable_fd>::iterator socket, socket_address sa);
+
+    future<> run(lw_shared_ptr<unified_port_state> self) {
+        // Keep all state alive until the acceptor and every independent detector
+        // have drained, including when the server_socket has already been destroyed.
+        try {
+            while (!_stopped) {
+                auto units = co_await get_units(_slots, 1);
+                auto accepted = co_await coroutine::as_future(_lfd.accept());
+                if (accepted.failed()) {
+                    completed_accept error = accepted.get_exception();
+                    // An OS accept error belongs to one accept() call. Keep the
+                    // listener alive so its caller can recover and retry.
+                    while (!_stopped && !_completed.push(std::move(error))) {
+                        co_await _completed.not_full();
+                    }
+                    // Persistent immediate failures must let other work run.
+                    co_await yield();
+                    continue;
+                }
+                if (_stopped) {
+                    break;
+                }
+                auto [fd, sa] = accepted.get();
+                auto socket = _pending.emplace(_pending.end(), std::move(fd));
+                (void)with_gate(_detectors, [this, socket, sa] {
+                    return detect(socket, sa);
+                }).handle_exception([] (std::exception_ptr ex) {
+                    seastar_logger.debug("unified port: dropping connection after preface failure: {}", ex);
+                }).finally([self, socket, units = std::move(units)] {
+                    self->_pending.erase(socket);
+                });
+            }
+        } catch (...) {
+            stop(std::current_exception());
+        }
+        co_await _detectors.close();
+    }
+};
+
+future<>
+posix_server_socket_impl::unified_port_state::detect(std::list<pollable_fd>::iterator socket, socket_address sa) {
+    auto& fd = *socket;
+    // One deadline covers all reads, including PPv2 payload and a following shard
+    // header. Shut down and drain the read rather than abandoning its buffer.
+    timer<lowres_clock> deadline([&fd] { cancel(fd); });
+    deadline.arm(lowres_clock::now() + unified_port_preface_timeout);
+    std::optional<proxy_data> addr_data_opt;
+    connection_metadata meta;
+    meta.physical_peer = sa;
+    std::optional<char> prefix;
+    bool has_shard_selection = false;
+    unsigned target_shard = 0;
+
+    // Read first byte to detect protocol layer
+    char first_byte;
+    if (!co_await read_exactly(fd, &first_byte, 1) || _stopped) {
+        seastar_logger.debug("unified port: EOF on first byte, dropping connection");
+        co_return;
+    }
+
+    // 1. Proxy Protocol v2 auto-detection (first byte 0x0D)
+    if (first_byte == 0x0D) {
+        if (_unified_port->proxy_protocol == unified_port_options::proxy_protocol_mode::disabled
+                || !_unified_port->trusted_proxy || !_unified_port->trusted_proxy(sa.addr())) {
+            seastar_logger.debug("unified port: PROXY header from a disallowed peer, dropping connection");
+            co_return;
+        }
+        // Might be PP v2. Read remaining 15 bytes of the 16-byte header.
+        char full_header[16];
+        full_header[0] = first_byte;
+        if (!co_await read_exactly(fd, full_header + 1, sizeof(full_header) - 1)) {
+            seastar_logger.debug("unified port: incomplete PP v2 header, dropping connection");
+            co_return;
+        }
+
+        if (std::memcmp(full_header, pp2_signature, sizeof(pp2_signature)) != 0) {
+            seastar_logger.debug("unified port: invalid PP v2 signature, dropping connection");
+            co_return;
+        }
+
+        auto len = read_be<uint16_t>(full_header + 14);
+
+        char stack_buffer[36];
+        std::unique_ptr<char[]> heap_buffer;
+        auto* buffer = stack_buffer;
+        if (len > sizeof(stack_buffer)) {
+            heap_buffer = std::make_unique<char[]>(len);
+            buffer = heap_buffer.get();
+        }
+
+        if (!co_await read_exactly(fd, buffer, len)) {
+            seastar_logger.debug("unified port: incomplete PP v2 address data, dropping connection");
+            co_return;
+        }
+
+        addr_data_opt = parse_pp2_addresses(full_header, buffer, len, fd);
+        if (!addr_data_opt) {
+            seastar_logger.debug("unified port: unsupported PP v2 address family or protocol, dropping connection");
+            co_return;
+        }
+        sa = addr_data_opt->remote_address;
+
+        // Read next byte for further detection
+        if (!co_await read_exactly(fd, &first_byte, 1)) {
+            seastar_logger.debug("unified port: EOF after PP v2 header, dropping connection");
+            co_return;
+        }
+    } else if (_unified_port->proxy_protocol == unified_port_options::proxy_protocol_mode::required) {
+        seastar_logger.debug("unified port: required PROXY header missing, dropping connection");
+        co_return;
+    }
+
+    // 2. Shard selection header auto-detection (magic 0xAA)
+    if (first_byte == unified_port_shard_select_magic) {
+        char hdr[3]; // remaining 3 bytes of 4-byte header
+        if (!co_await read_exactly(fd, hdr, 3)) {
+            seastar_logger.debug("unified port: incomplete shard selection header, dropping connection");
+            co_return;
+        }
+
+        uint8_t flags = static_cast<uint8_t>(hdr[0]);
+        if (flags & ~uint8_t(0x01)) {
+            seastar_logger.debug("unified port: reserved shard header flags, dropping connection");
+            co_return;
+        }
+        meta.is_tls = (flags & 0x01) != 0;
+        uint16_t shard_id = (static_cast<uint16_t>(static_cast<uint8_t>(hdr[1])) << 8)
+                          | static_cast<uint8_t>(hdr[2]);
+        target_shard = shard_id % this_smp_shard_count();
+        has_shard_selection = true;
+        // All header bytes consumed, fd stream starts with TLS or CQL data
+    } else {
+        // 3. Legacy client: first_byte is TLS (0x16) or CQL version (0x03+)
+        meta.is_tls = (static_cast<uint8_t>(first_byte) == 0x16);
+        // Save consumed byte as prefix to prepend to the data stream
+        prefix = first_byte;
+    }
+
+    if ((meta.is_tls && _unified_port->encryption == unified_port_options::encryption_mode::plain_only)
+            || (!meta.is_tls && _unified_port->encryption == unified_port_options::encryption_mode::tls_only)) {
+        seastar_logger.debug("unified port: transport rejected by encryption policy");
+        co_return;
+    }
+
+    if (!deadline.cancel() || _stopped) {
+        co_return;
+    }
+
+    // Explicit shard headers take precedence over source-port routing.
+    auto cth = has_shard_selection ? _conntrack.get_handle(target_shard)
+        : _unified_port->source_port_routing ? _conntrack.get_handle(get_port_or_counter(sa) % this_smp_shard_count())
+        : _conntrack.get_handle();
+
+    auto cpu = cth.cpu();
+    if (cpu == this_shard_id()) {
+        auto csi = make_unified_port_connected_socket_impl(
+            sa.family(), _protocol, std::move(fd), std::move(cth),
+            std::move(addr_data_opt), prefix, _allocator);
+        // A full serving queue drops the new connection instead of accumulating
+        // unbounded completed sockets while the application is not accepting.
+        _completed.push(accept_result{connected_socket(std::move(csi)), sa, meta});
+    } else {
+        co_await smp::submit_to(cpu, [protocol = _protocol, ssa = _sa,
+                fd = fd.detach_file_desc(), sa, cth = std::move(cth),
+                addr_data_opt = std::move(addr_data_opt), allocator = _allocator,
+                meta, prefix] () mutable {
+            posix_ap_server_socket_impl::move_connected_socket(
+                protocol, ssa, pollable_fd(std::move(fd)), sa, std::move(cth),
+                std::move(addr_data_opt), allocator, meta, prefix);
+        });
+    }
+}
+
+// The legacy accept loop is serial, but its pending I/O must outlive the
+// listener when destruction cancels a fragmented PPv2 read.
+struct posix_server_socket_impl::proxy_protocol_state {
+    pollable_fd listener;
+    pollable_fd pending;
+    size_t bytes_read = 0;
+    bool stopped = false;
+
+    explicit proxy_protocol_state(pollable_fd fd) : listener(std::move(fd)) {}
+
+    void stop() noexcept {
+        if (std::exchange(stopped, true)) {
+            return;
+        }
+        if (pending) {
+            shutdown_socket_fd(pending, SHUT_RDWR);
+        }
+        try {
+            listener.shutdown(SHUT_RD, pollable_fd::shutdown_kernel_only::no);
+        } catch (...) {
+        }
+    }
+};
+
+size_t posix_server_socket_impl::proxy_protocol_bytes_read() const noexcept {
+    return _proxy_state ? _proxy_state->bytes_read : 0;
+}
+
+posix_server_socket_impl::posix_server_socket_impl(int protocol, socket_address sa, pollable_fd lfd,
+        server_socket::load_balancing_algorithm lba, shard_id fixed_cpu, bool proxy_protocol,
+        std::optional<unified_port_options> unified_port, std::pmr::polymorphic_allocator<char>* allocator)
+    : _sa(sa), _protocol(protocol), _lfd(std::move(lfd)), _lba(lba), _fixed_cpu(fixed_cpu)
+    , _proxy_protocol(proxy_protocol), _unified_port(std::move(unified_port)), _allocator(allocator) {
+    if (_proxy_protocol) {
+        _proxy_state = make_lw_shared<proxy_protocol_state>(_lfd);
+    }
+}
+
+posix_server_socket_impl::~posix_server_socket_impl() {
+    if (_proxy_state) {
+        _proxy_state->stop();
+    }
+    if (_unified_state) {
+        _unified_state->stop();
+    }
+}
+
+future<accept_result>
+posix_server_socket_impl::accept_unified_port() {
+    if (!_unified_state) {
+        _unified_state = make_lw_shared<unified_port_state>(*this);
+        (void)_unified_state->run(_unified_state);
+    }
+    auto state = _unified_state;
+    auto completed = co_await state->_completed.pop_eventually();
+    if (auto error = std::get_if<std::exception_ptr>(&completed)) {
+        co_return coroutine::exception(*error);
+    }
+    co_return std::move(std::get<accept_result>(completed));
+}
+
 future<accept_result>
 posix_server_socket_impl::accept() {
+    if (_unified_port) {
+        co_return co_await accept_unified_port();
+    }
+    auto proxy = _proxy_state;
     while (true) { // exited via co_return
         auto [fd, sa] = co_await _lfd.accept();
+        // Destruction may have cancelled the wait. Use retained state before
+        // touching any listener member after an asynchronous operation.
+        if (proxy && proxy->stopped) {
+            throw std::system_error(ECONNABORTED, std::system_category());
+        }
 
         std::optional<proxy_data> addr_data_opt;
         if (_proxy_protocol) {
-            addr_data_opt = co_await read_proxy_data(fd);
-            if (!addr_data_opt) {
+            // Preserve fragmented headers without letting a partial peer hold
+            // serial admission or listener shutdown indefinitely.
+            proxy->pending = fd;
+            proxy->bytes_read = 0;
+            auto clear_pending = defer([proxy] () noexcept { proxy->pending = {}; });
+            timer<lowres_clock> deadline([proxy] { shutdown_socket_fd(proxy->pending, SHUT_RDWR); });
+            deadline.arm(lowres_clock::now() + std::chrono::seconds(5));
+            try {
+                addr_data_opt = co_await read_proxy_data(fd, [proxy] (size_t bytes) { proxy->bytes_read += bytes; });
+            } catch (const std::system_error&) {
+                // Reset peers are dropped like incomplete or invalid headers.
+            }
+            if (proxy->stopped) {
+                throw std::system_error(ECONNABORTED, std::system_category());
+            }
+            if (!deadline.cancel() || !addr_data_opt) {
                 continue; // drop the connection
             }
             sa = addr_data_opt->remote_address;
@@ -744,6 +1171,14 @@ posix_server_socket_impl::accept() {
 
 void
 posix_server_socket_impl::abort_accept() {
+    if (_proxy_state) {
+        _proxy_state->stop();
+        return;
+    }
+    if (_unified_state) {
+        _unified_state->stop();
+        return;
+    }
     _lfd.shutdown(SHUT_RD, pollable_fd::shutdown_kernel_only::no);
 }
 
@@ -751,16 +1186,19 @@ socket_address posix_server_socket_impl::local_address() const {
     return _lfd.get_file_desc().get_address();
 }
 
-posix_ap_server_socket_impl::posix_ap_server_socket_impl(int protocol, socket_address sa, std::pmr::polymorphic_allocator<char>* allocator)
-        : _protocol(protocol), _sa(sa), _allocator(allocator)
+posix_ap_server_socket_impl::posix_ap_server_socket_impl(int protocol, socket_address sa, std::pmr::polymorphic_allocator<char>* allocator, bool unified_port)
+        : _protocol(protocol), _sa(sa), _allocator(allocator), _unified_port(unified_port)
 {
-    auto it = ports.emplace(std::make_tuple(_protocol, _sa));
+    auto it = ports.emplace(std::make_tuple(_protocol, _sa), port_state{unified_port});
     if (!it.second) {
         throw std::system_error(EADDRINUSE, std::system_category());
     }
 }
 
 posix_ap_server_socket_impl::~posix_ap_server_socket_impl() {
+    if (_unified_port) {
+        abort_accept();
+    }
     auto t_sa = std::make_tuple(_protocol, _sa);
     conn_q.erase(t_sa);
     ports.erase(t_sa);
@@ -768,13 +1206,19 @@ posix_ap_server_socket_impl::~posix_ap_server_socket_impl() {
 
 future<accept_result> posix_ap_server_socket_impl::accept() {
     auto t_sa = std::make_tuple(_protocol, _sa);
+    if (_unified_port && ports.at(t_sa).aborted) {
+        return make_exception_future<accept_result>(std::system_error(ECONNABORTED, std::system_category()));
+    }
     auto conni = conn_q.find(t_sa);
     if (conni != conn_q.end()) {
         connection c = std::move(conni->second);
         conn_q.erase(conni);
         try {
-            auto csi = std::make_unique<posix_connected_socket_impl>(_sa.family(), _protocol, std::move(c.fd), std::move(c.connection_tracking_handle), _allocator);
-            return make_ready_future<accept_result>(accept_result{connected_socket(std::move(csi)), std::move(c.addr)});
+            auto csi = make_unified_port_connected_socket_impl(
+                _sa.family(), _protocol, std::move(c.fd),
+                std::move(c.connection_tracking_handle),
+                std::move(c.proxy_protocol_header_opt), c.prefix, _allocator);
+            return make_ready_future<accept_result>(accept_result{connected_socket(std::move(csi)), std::move(c.addr), c.metadata});
         } catch (...) {
             return make_exception_future<accept_result>(std::current_exception());
         }
@@ -792,6 +1236,9 @@ future<accept_result> posix_ap_server_socket_impl::accept() {
 void
 posix_ap_server_socket_impl::abort_accept() {
     auto t_sa = std::make_tuple(_protocol, _sa);
+    if (_unified_port) {
+        ports.at(t_sa).aborted = true;
+    }
     conn_q.erase(t_sa);
     auto i = sockets.find(t_sa);
     if (i != sockets.end()) {
@@ -817,27 +1264,27 @@ socket_address posix_reuseport_server_socket_impl::local_address() const {
 }
 
 void
-posix_ap_server_socket_impl::move_connected_socket(int protocol, socket_address sa, pollable_fd fd, socket_address addr, conntrack::handle cth, std::optional<proxy_data> addr_data_opt, std::pmr::polymorphic_allocator<char>* allocator) {
+posix_ap_server_socket_impl::move_connected_socket(int protocol, socket_address sa, pollable_fd fd, socket_address addr,
+        conntrack::handle cth, std::optional<proxy_data> addr_data_opt, std::pmr::polymorphic_allocator<char>* allocator,
+        connection_metadata meta, std::optional<char> prefix) {
     auto t_sa = std::make_tuple(protocol, sa);
     auto i = sockets.find(t_sa);
     if (i != sockets.end()) {
         try {
-            auto csi = make_maybe_proxied_connected_socket_impl(
-                sa.family(),
-                protocol,
-                std::move(fd),
-                std::move(cth),
-                std::move(addr_data_opt),
-                allocator);
-            i->second.set_value(accept_result{connected_socket(std::move(csi)), std::move(addr)});
+            auto csi = make_unified_port_connected_socket_impl(
+                sa.family(), protocol, std::move(fd), std::move(cth),
+                std::move(addr_data_opt), prefix, allocator);
+            i->second.set_value(accept_result{connected_socket(std::move(csi)), std::move(addr), meta});
         } catch (...) {
             i->second.set_exception(std::current_exception());
         }
         sockets.erase(i);
-    } else if (ports.contains(t_sa)) {
-        conn_q.emplace(std::piecewise_construct, std::make_tuple(t_sa), std::make_tuple(std::move(fd), std::move(addr), std::move(cth), std::move(addr_data_opt)));
+    } else if (auto port = ports.find(t_sa); port != ports.end() && !port->second.aborted
+            && (!port->second.unified || conn_q.count(t_sa) < unified_port_max_completed)) {
+        conn_q.emplace(std::piecewise_construct, std::make_tuple(t_sa),
+                std::make_tuple(std::move(fd), std::move(addr), std::move(cth), std::move(addr_data_opt), meta, prefix));
     } else {
-        // No one is listening anymore; drop the connection to avoid leaking it.
+        // The listener stopped or its completion queue is full; drop the socket.
         fd.close();
     }
 }
@@ -913,18 +1360,23 @@ posix_network_stack::posix_network_stack(const program_options::option_group& op
 server_socket
 posix_network_stack::listen(socket_address sa, listen_options opt) {
     using server_socket = seastar::server_socket;
+    if (opt.unified_port && opt.proxy_protocol) {
+        throw std::invalid_argument("unified_port and proxy_protocol cannot both be set");
+    }
     // allow unspecified bind address -> default to ipv4 wildcard
     if (sa.is_unspecified()) {
         sa = inet_address(inet_address::family::INET);
     }
     if (sa.is_af_unix()) {
-        return server_socket(std::make_unique<posix_server_socket_impl>(0, sa, internal::posix_listen(sa, opt), opt.lba, opt.fixed_cpu, opt.proxy_protocol, _allocator));
+        return server_socket(std::make_unique<posix_server_socket_impl>(0, sa, internal::posix_listen(sa, opt),
+                opt.lba, opt.fixed_cpu, opt.proxy_protocol, opt.unified_port, _allocator));
     }
     auto protocol = static_cast<int>(opt.proto);
-    return _reuseport ?
+    return _reuseport && !opt.unified_port ?
         server_socket(std::make_unique<posix_reuseport_server_socket_impl>(protocol, sa, internal::posix_listen(sa, opt), _allocator))
         :
-        server_socket(std::make_unique<posix_server_socket_impl>(protocol, sa, internal::posix_listen(sa, opt), opt.lba, opt.fixed_cpu, opt.proxy_protocol, _allocator));
+        server_socket(std::make_unique<posix_server_socket_impl>(protocol, sa, internal::posix_listen(sa, opt),
+                opt.lba, opt.fixed_cpu, opt.proxy_protocol, opt.unified_port, _allocator));
 }
 
 ::seastar::socket posix_network_stack::socket() {
@@ -939,6 +1391,9 @@ posix_ap_network_stack::posix_ap_network_stack(const program_options::option_gro
 server_socket
 posix_ap_network_stack::listen(socket_address sa, listen_options opt) {
     using server_socket = seastar::server_socket;
+    if (opt.unified_port && opt.proxy_protocol) {
+        throw std::invalid_argument("unified_port and proxy_protocol cannot both be set");
+    }
     // allow unspecified bind address -> default to ipv4 wildcard
     if (sa.is_unspecified()) {
         sa = inet_address(inet_address::family::INET);
@@ -947,10 +1402,10 @@ posix_ap_network_stack::listen(socket_address sa, listen_options opt) {
         return server_socket(std::make_unique<posix_ap_server_socket_impl>(0, sa, _allocator));
     }
     auto protocol = static_cast<int>(opt.proto);
-    return posix_network_stack::_reuseport ?
+    return posix_network_stack::_reuseport && !opt.unified_port ?
         server_socket(std::make_unique<posix_reuseport_server_socket_impl>(protocol, sa, internal::posix_listen(sa, opt), _allocator))
         :
-        server_socket(std::make_unique<posix_ap_server_socket_impl>(protocol, sa, _allocator));
+        server_socket(std::make_unique<posix_ap_server_socket_impl>(protocol, sa, _allocator, opt.unified_port.has_value()));
 }
 
 class posix_datagram_channel : public datagram_channel_impl {
