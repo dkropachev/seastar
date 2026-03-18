@@ -22,12 +22,14 @@
 #pragma once
 
 #include <chrono>
+#include <functional>
 #include <memory>
 #include <vector>
 #include <cstring>
 #include <sys/types.h>
 
 #include <seastar/core/future.hh>
+#include <seastar/util/noncopyable_function.hh>
 #include <seastar/net/byteorder.hh>
 #include <seastar/net/socket_defs.hh>
 #include <seastar/net/packet.hh>
@@ -338,10 +340,19 @@ public:
 /// \addtogroup networking-module
 /// @{
 
+/// Metadata about an accepted connection, populated by a connection detector callback.
+struct connection_metadata {
+    bool is_tls = false;                            ///< Whether TLS follows (peeked, not consumed)
+    std::optional<shard_id> target_shard;           ///< Explicit shard routing request
+    std::optional<socket_address> remote_address;   ///< Override peer address (e.g. from proxy protocol)
+    std::optional<socket_address> local_address;    ///< Override local address
+};
+
 /// The result of an server_socket::accept() call
 struct accept_result {
     connected_socket connection;  ///< The newly-accepted connection
     socket_address remote_address;  ///< The address of the peer that connected to us
+    connection_metadata metadata;  ///< Additional metadata from protocol detection
 };
 
 /// A listening socket, waiting to accept incoming network connections.
@@ -441,16 +452,30 @@ struct listen_options {
         fixed_cpu = cpu;
     }
 
-    // The connection is encapsulated with proxy protocol (which is just
-    // a header prepended to the data stream). connected_socket::remote_address()
-    // and connected_socket::local_address() will return the addresses
-    // as specified in the proxy protocol header. load_balancing_algorithm::port
-    // will use the port from the proxy protocol header.
-    //
-    // Currently only proxy protocol v2 binary format is supported.
-    //
-    // The proxy protocol is defined in https://www.haproxy.org/download/1.8/doc/proxy-protocol.txt
-    bool proxy_protocol = false;
+    /// Provides read and peek access to a newly-accepted connection.
+    /// - read(n): reads exactly n bytes, consuming them from the stream.
+    /// - peek(n): reads exactly n bytes via MSG_PEEK without consuming them.
+    ///   Subsequent read/peek calls will see the same bytes again.
+    /// Both return an empty buffer on EOF or error.
+    struct connection_inspector {
+        noncopyable_function<future<temporary_buffer<char>>(size_t)> read;
+        noncopyable_function<future<temporary_buffer<char>>(size_t)> peek;
+    };
+
+    /// Connection detector callback, called on each newly-accepted connection
+    /// before shard routing. It can peek/read bytes from the connection to
+    /// determine the protocol, target shard, and peer address.
+    /// Return connection_metadata to accept, std::nullopt to drop.
+    /// Peeked-but-not-consumed bytes remain in the kernel buffer and are
+    /// delivered to the application naturally — no prefix wrapper needed.
+    using connection_detector = std::function<
+        future<std::optional<connection_metadata>>(connection_inspector, socket_address)>;
+
+    /// If set, this callback is invoked on each accepted connection before
+    /// shard routing. The callback can read protocol headers (e.g. proxy
+    /// protocol, meta-frame), determine the target shard, override the
+    /// peer address, and return unconsumed bytes to prepend to the stream.
+    connection_detector detect;
 };
 
 class network_interface {
